@@ -25,12 +25,20 @@ logger = logging.getLogger("netbox.plugins.netbox_discovery")
 # ---------------------------------------------------------------------------
 
 
+class DiscoveryTargetBulkDeleteView(generic.BulkDeleteView):
+    queryset = DiscoveryTarget.objects.all()
+    filterset = DiscoveryTargetFilterSet
+    table = DiscoveryTargetTable
+    default_return_url = "plugins:netbox_discovery:discoverytarget_list"
+
+
 class DiscoveryTargetListView(generic.ObjectListView):
     queryset = DiscoveryTarget.objects.all()
     table = DiscoveryTargetTable
     filterset = DiscoveryTargetFilterSet
     filterset_form = DiscoveryTargetFilterForm
     template_name = "netbox_discovery/discoverytarget_list.html"
+    bulk_delete_url = "plugins:netbox_discovery:discoverytarget_bulk_delete"
 
 
 class DiscoveryTargetView(generic.ObjectView):
@@ -119,12 +127,20 @@ class DiscoveryRunDeleteView(generic.ObjectDeleteView):
     default_return_url = "plugins:netbox_discovery:discoveryrun_list"
 
 
+class DiscoveryRunBulkDeleteView(generic.BulkDeleteView):
+    queryset = DiscoveryRun.objects.select_related("target")
+    filterset = DiscoveryRunFilterSet
+    table = DiscoveryRunTable
+    default_return_url = "plugins:netbox_discovery:discoveryrun_list"
+
+
 class DiscoveryRunListView(generic.ObjectListView):
     queryset = DiscoveryRun.objects.select_related("target").order_by("-started_at")
     table = DiscoveryRunTable
     filterset = DiscoveryRunFilterSet
     filterset_form = DiscoveryRunFilterForm
     template_name = "netbox_discovery/discoveryrun_list.html"
+    bulk_delete_url = "plugins:netbox_discovery:discoveryrun_bulk_delete"
 
 
 class DiscoveryRunView(generic.ObjectView):

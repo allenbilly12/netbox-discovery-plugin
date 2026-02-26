@@ -32,6 +32,11 @@ urlpatterns = [
         name="discoverytarget_delete",
     ),
     path(
+        "targets/delete/",
+        views.DiscoveryTargetBulkDeleteView.as_view(),
+        name="discoverytarget_bulk_delete",
+    ),
+    path(
         "targets/<int:pk>/run/",
         views.DiscoveryTargetRunView.as_view(),
         name="discoverytarget_run",
@@ -51,5 +56,10 @@ urlpatterns = [
         "runs/<int:pk>/delete/",
         views.DiscoveryRunDeleteView.as_view(),
         name="discoveryrun_delete",
+    ),
+    path(
+        "runs/delete/",
+        views.DiscoveryRunBulkDeleteView.as_view(),
+        name="discoveryrun_bulk_delete",
     ),
 ]
