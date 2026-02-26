@@ -75,62 +75,73 @@ def crawl(
             continue
         visited.add(ip)
 
-        log_fn(f"[depth={depth}] Connecting to {ip}...")
-
-        device, driver_name = detect_and_connect(
-            ip=ip,
-            username=username,
-            password=password,
-            enable_secret=enable_secret,
-            timeout=timeout,
-            preferred_driver=preferred_driver,
-            log_fn=log_fn,
-        )
-
-        if device is None:
-            log_fn(f"  [FAILED] Could not connect to {ip}")
-            summary["failed"] += 1
-            continue
-
+        # Outer per-IP guard: any unhandled exception skips to the next device
         try:
-            log_fn(f"  [OK] Connected via {driver_name}. Collecting data...")
-            data = collect_device_data(device, driver_name, discovery_protocol)
+            log_fn(f"[depth={depth}] Connecting to {ip}...")
 
-            facts = data.get("facts", {})
-            hostname = facts.get("hostname", ip)
-            log_fn(
-                f"  Hostname: {hostname} | Vendor: {facts.get('vendor', '?')} "
-                f"| Model: {facts.get('model', '?')}"
+            device, driver_name = detect_and_connect(
+                ip=ip,
+                username=username,
+                password=password,
+                enable_secret=enable_secret,
+                timeout=timeout,
+                preferred_driver=preferred_driver,
+                log_fn=log_fn,
             )
 
-            # Invoke the sync callback
-            if on_device_data:
+            if device is None:
+                log_fn(f"  [FAILED] {ip} — could not connect with any driver. Skipping.")
+                summary["failed"] += 1
+                continue
+
+            try:
+                log_fn(f"  [OK] Connected via '{driver_name}'. Collecting data...")
+                data = collect_device_data(device, driver_name, discovery_protocol)
+
+                facts = data.get("facts", {})
+                hostname = facts.get("hostname", ip)
+                log_fn(
+                    f"  Hostname: {hostname} | Vendor: {facts.get('vendor', '?')} "
+                    f"| Model: {facts.get('model', '?')} | Serial: {facts.get('serial_number', '?')}"
+                )
+
+                if data.get("raw_errors"):
+                    for err in data["raw_errors"]:
+                        log_fn(f"  [WARN] {err}")
+
+                # NetBox sync
+                if on_device_data:
+                    try:
+                        on_device_data(ip, data, driver_name)
+                    except Exception as exc:
+                        log_fn(f"  [ERROR] NetBox sync failed for {ip}: {exc} — continuing")
+                        logger.exception("Sync error for %s", ip)
+
+                summary["connected"] += 1
+
+                # Enqueue neighbors
+                if depth < max_depth:
+                    new_ips = _extract_neighbor_ips(data.get("neighbors", []))
+                    for neighbor_ip in new_ips:
+                        if neighbor_ip and neighbor_ip not in visited:
+                            log_fn(f"  Queuing neighbor: {neighbor_ip} (depth={depth + 1})")
+                            queue.append((neighbor_ip, depth + 1))
+                            summary["neighbors_queued"] += 1
+
+            except Exception as exc:
+                log_fn(f"  [ERROR] Data collection failed for {ip}: {exc} — skipping device")
+                logger.exception("Collection error for %s", ip)
+                summary["failed"] += 1
+            finally:
                 try:
-                    on_device_data(ip, data, driver_name)
-                except Exception as exc:
-                    log_fn(f"  [ERROR] Sync failed for {ip}: {exc}")
-                    logger.exception("Sync error for %s", ip)
-
-            summary["connected"] += 1
-
-            # Enqueue neighbors if we haven't reached max depth
-            if depth < max_depth:
-                new_ips = _extract_neighbor_ips(data.get("neighbors", []))
-                for neighbor_ip in new_ips:
-                    if neighbor_ip and neighbor_ip not in visited:
-                        log_fn(f"  Queuing neighbor: {neighbor_ip} (depth={depth + 1})")
-                        queue.append((neighbor_ip, depth + 1))
-                        summary["neighbors_queued"] += 1
+                    device.close()
+                except Exception:
+                    pass
 
         except Exception as exc:
-            log_fn(f"  [ERROR] Data collection error for {ip}: {exc}")
-            logger.exception("Collection error for %s", ip)
+            log_fn(f"[ERROR] Unexpected error processing {ip}: {exc} — continuing")
+            logger.exception("Unexpected crawl error for %s", ip)
             summary["failed"] += 1
-        finally:
-            try:
-                device.close()
-            except Exception:
-                pass
 
     log_fn(
         f"Crawl complete. Connected: {summary['connected']}, "
