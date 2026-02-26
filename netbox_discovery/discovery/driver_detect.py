@@ -90,19 +90,30 @@ def _try_driver_timed(
     discovery job.
     """
     deadline = timeout + 2  # a little headroom over the NAPALM timeout
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(
-            _try_driver,
-            driver_name, ip, username, password, enable_secret, timeout, log_fn,
+
+    # Do NOT use 'with ThreadPoolExecutor(...) as executor:' here.
+    # The context manager calls shutdown(wait=True) on __exit__, which blocks
+    # until the background thread finishes — exactly the 60-second pyeapi hang
+    # we are trying to avoid.  Instead, call shutdown(wait=False) so we
+    # abandon any stuck thread and return immediately.
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        _try_driver,
+        driver_name, ip, username, password, enable_secret, timeout, log_fn,
+    )
+    try:
+        return future.result(timeout=deadline)
+    except FuturesTimeoutError:
+        log_fn(
+            f"    Driver '{driver_name}' killed after {deadline}s "
+            f"(internal timeout did not fire in time)"
         )
-        try:
-            return future.result(timeout=deadline)
-        except FuturesTimeoutError:
-            log_fn(
-                f"    Driver '{driver_name}' killed after {deadline}s "
-                f"(internal timeout did not fire in time)"
-            )
-            return None
+        return None
+    finally:
+        # cancel_futures=True drops queued (not yet started) futures.
+        # The already-running thread cannot be cancelled — it will die on its
+        # own when pyeapi's socket eventually times out.
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def detect_and_connect(
