@@ -3,9 +3,14 @@ NAPALM driver auto-detection.
 
 Tries each driver in priority order (Cisco IOS/NX-OS first per preference).
 Returns the first driver that successfully connects and calls get_facts().
+
+Each attempt is capped at (timeout + 2) seconds using a background thread so
+that drivers with their own internal timeouts (e.g. EOS/pyeapi uses the OS
+default HTTP socket timeout of 60 s) cannot stall the crawl.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
@@ -66,6 +71,40 @@ def _try_driver(
         return None
 
 
+def _try_driver_timed(
+    driver_name: str,
+    ip: str,
+    username: str,
+    password: str,
+    enable_secret: str,
+    timeout: int,
+    log_fn: Callable,
+) -> Optional[object]:
+    """
+    Wrapper around _try_driver that enforces a hard wall-clock timeout.
+
+    Some drivers (notably EOS/pyeapi) use HTTP connections whose internal
+    timeout ignores the NAPALM `timeout` parameter and falls back to the OS
+    default (typically 60 s).  Running the attempt in a thread and joining
+    with a deadline prevents a single slow driver from stalling the entire
+    discovery job.
+    """
+    deadline = timeout + 2  # a little headroom over the NAPALM timeout
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            _try_driver,
+            driver_name, ip, username, password, enable_secret, timeout, log_fn,
+        )
+        try:
+            return future.result(timeout=deadline)
+        except FuturesTimeoutError:
+            log_fn(
+                f"    Driver '{driver_name}' killed after {deadline}s "
+                f"(internal timeout did not fire in time)"
+            )
+            return None
+
+
 def detect_and_connect(
     ip: str,
     username: str,
@@ -96,7 +135,9 @@ def detect_and_connect(
     log_fn(f"  Trying drivers {drivers_to_try} for {ip} (user={username})")
 
     for driver_name in drivers_to_try:
-        device = _try_driver(driver_name, ip, username, password, enable_secret, timeout, log_fn)
+        device = _try_driver_timed(
+            driver_name, ip, username, password, enable_secret, timeout, log_fn
+        )
         if device is not None:
             log_fn(f"  [OK] Connected to {ip} via '{driver_name}'")
             return device, driver_name
