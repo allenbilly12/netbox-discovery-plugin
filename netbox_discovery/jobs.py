@@ -7,7 +7,6 @@ discovery_scheduler: system_job that fires every N minutes and enqueues
 """
 
 import logging
-from datetime import timedelta
 
 from django.conf import settings
 from django.utils import timezone
@@ -32,16 +31,16 @@ class DiscoveryJob(JobRunner):
 
         target_id = data.get("target_id")
         if not target_id:
-            self.log_failure("No target_id in job data")
+            self._safe_log("No target_id in job data")
             return
 
         try:
             target = DiscoveryTarget.objects.get(pk=target_id)
         except DiscoveryTarget.DoesNotExist:
-            self.log_failure(f"DiscoveryTarget {target_id} not found")
+            self._safe_log(f"DiscoveryTarget {target_id} not found")
             return
 
-        # Create a DiscoveryRun record
+        # Create run record
         run = DiscoveryRun.objects.create(
             target=target,
             status="running",
@@ -62,29 +61,28 @@ class DiscoveryJob(JobRunner):
             "errors": 0,
         }
         log_lines = []
+        final_status = "failed"
 
         def log_fn(msg):
-            self.log_info(msg)
             log_lines.append(msg)
-            logger.info("[DiscoveryJob target=%s] %s", target.name, msg)
+            logger.info("[Discovery:%s] %s", target.name, msg)
+            self._safe_log(msg)
 
         try:
-            log_fn(f"=== Discovery started for target: {target.name} ===")
+            log_fn(f"=== Discovery started: {target.name} ===")
             log_fn(f"Targets: {target.get_target_list()}")
-            log_fn(f"Protocol: {target.discovery_protocol}, Max depth: {target.max_depth}")
+            log_fn(f"Protocol: {target.discovery_protocol} | Max depth: {target.max_depth}")
 
-            # Step 1: Ping sweep
+            # Step 1: host scan
             live_ips = scan_targets(target.get_target_list(), log_fn=log_fn)
             counters["hosts_scanned"] = len(live_ips)
-            log_fn(f"Live hosts found: {len(live_ips)}")
 
             if not live_ips:
-                log_fn("No live hosts found. Exiting.")
-                _finish_run(run, counters, "completed", "\n".join(log_lines))
-                _update_last_run(target)
+                log_fn("No live hosts found. Done.")
+                final_status = "completed"
                 return
 
-            # Step 2: BFS crawl + sync
+            # Step 2: BFS crawl + NetBox sync
             def on_device(ip, device_data, driver_name):
                 try:
                     device_name, was_created = sync_device(
@@ -98,7 +96,7 @@ class DiscoveryJob(JobRunner):
                     else:
                         counters["devices_updated"] += 1
                 except Exception as exc:
-                    log_fn(f"  [ERROR] sync_device failed for {ip}: {exc}")
+                    log_fn(f"  [ERROR] Sync failed for {ip}: {exc}")
                     logger.exception("sync_device error for %s", ip)
                     counters["errors"] += 1
 
@@ -116,40 +114,66 @@ class DiscoveryJob(JobRunner):
             )
             counters["errors"] += crawl_summary.get("failed", 0)
 
-            log_fn(f"=== Discovery complete ===")
             log_fn(
-                f"Hosts scanned: {counters['hosts_scanned']} | "
-                f"Created: {counters['devices_created']} | "
-                f"Updated: {counters['devices_updated']} | "
-                f"Errors: {counters['errors']}"
+                f"=== Done: scanned={counters['hosts_scanned']} "
+                f"created={counters['devices_created']} "
+                f"updated={counters['devices_updated']} "
+                f"errors={counters['errors']} ==="
             )
-
             final_status = "partial" if counters["errors"] > 0 else "completed"
+
+        except Exception as exc:
+            log_fn(f"[FATAL] Job crashed: {exc}")
+            logger.exception("DiscoveryJob fatal error for target %s", target.name)
+            counters["errors"] += 1
+            final_status = "failed"
+
+        finally:
+            # Always update the run record regardless of success/failure/early return
             _finish_run(run, counters, final_status, "\n".join(log_lines))
             _update_last_run(target)
 
-        except Exception as exc:
-            log_fn(f"[FATAL] Discovery job crashed: {exc}")
-            logger.exception("DiscoveryJob fatal error for target %s", target.name)
-            counters["errors"] += 1
-            _finish_run(run, counters, "failed", "\n".join(log_lines))
-            raise
+    def _safe_log(self, msg: str):
+        """Log via NetBox JobRunner methods, silently ignoring if unavailable."""
+        try:
+            self.log_info(msg)
+        except Exception:
+            try:
+                self.job.log(msg)
+            except Exception:
+                pass  # already logged via Python logger above
 
 
 def _finish_run(run, counters: dict, status: str, log_text: str):
-    run.status = status
-    run.completed_at = timezone.now()
-    run.hosts_scanned = counters["hosts_scanned"]
-    run.devices_created = counters["devices_created"]
-    run.devices_updated = counters["devices_updated"]
-    run.errors = counters["errors"]
-    run.log = log_text
-    run.save()
+    """Update DiscoveryRun with final status. Never raises."""
+    try:
+        run.status = status
+        run.completed_at = timezone.now()
+        run.hosts_scanned = counters.get("hosts_scanned", 0)
+        run.devices_created = counters.get("devices_created", 0)
+        run.devices_updated = counters.get("devices_updated", 0)
+        run.errors = counters.get("errors", 0)
+        run.log = log_text
+        run.save()
+    except Exception as exc:
+        logger.error("Failed to save DiscoveryRun %s: %s", run.pk, exc)
+        # Last-ditch attempt via queryset update (bypasses model signals)
+        try:
+            run.__class__.objects.filter(pk=run.pk).update(
+                status=status,
+                completed_at=timezone.now(),
+                log=log_text[:10000],
+            )
+        except Exception:
+            pass
 
 
 def _update_last_run(target):
-    target.last_run = timezone.now()
-    target.save(update_fields=["last_run"])
+    """Update target.last_run. Never raises."""
+    try:
+        target.__class__.objects.filter(pk=target.pk).update(last_run=timezone.now())
+    except Exception as exc:
+        logger.error("Failed to update last_run for target %s: %s", target.pk, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -168,9 +192,7 @@ try:
         from .models import DiscoveryTarget
 
         now = timezone.now()
-        due_targets = DiscoveryTarget.objects.filter(enabled=True, scan_interval__gt=0)
-
-        for target in due_targets:
+        for target in DiscoveryTarget.objects.filter(enabled=True, scan_interval__gt=0):
             if target.last_run is None:
                 due = True
             else:
@@ -179,18 +201,13 @@ try:
 
             if due:
                 logger.info(
-                    "Scheduling DiscoveryJob for target '%s' (interval=%d min)",
+                    "Scheduling DiscoveryJob for '%s' (interval=%d min)",
                     target.name,
                     target.scan_interval,
                 )
-                DiscoveryJob.enqueue(
-                    data={"target_id": target.pk},
-                    name=f"Discovery: {target.name}",
-                )
+                DiscoveryJob.enqueue(data={"target_id": target.pk})
 
 except ImportError:
-    # system_job not available in this NetBox version; scheduling skipped
     logger.warning(
-        "netbox.jobs.system_job not available; periodic scheduling disabled. "
-        "Use the 'Run Now' button or configure an external cron job instead."
+        "netbox.jobs.system_job not available — periodic scheduling disabled."
     )
