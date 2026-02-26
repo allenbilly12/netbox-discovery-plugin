@@ -41,6 +41,10 @@ def _try_driver(
             "ssh_config_file": None,
             # Disable strict host key checking (common in lab environments)
             "ssh_strict": False,
+            # Accept legacy ciphers/key-exchange algorithms (needed for older IOS)
+            "disabled_algorithms": {
+                "pubkeys": ["rsa-sha2-256", "rsa-sha2-512"],
+            },
         }
         if enable_secret:
             optional_args["secret"] = enable_secret
