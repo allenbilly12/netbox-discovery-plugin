@@ -84,6 +84,7 @@ def crawl(
             enable_secret=enable_secret,
             timeout=timeout,
             preferred_driver=preferred_driver,
+            log_fn=log_fn,
         )
 
         if device is None:
