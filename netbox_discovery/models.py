@@ -146,6 +146,16 @@ class DiscoveryTarget(NetBoxModel):
     def enable_secret(self, raw):
         self._enable_secret = encrypt_value(raw)
 
+    @property
+    def has_password(self):
+        """Template-safe check for whether a per-target password is stored."""
+        return bool(self._credential_password)
+
+    @property
+    def has_enable_secret(self):
+        """Template-safe check for whether a per-target enable secret is stored."""
+        return bool(self._enable_secret)
+
     def get_effective_username(self):
         """Return per-target username or fall back to global config."""
         if self.credential_username:

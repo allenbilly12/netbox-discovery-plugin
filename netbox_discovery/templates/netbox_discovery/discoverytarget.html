@@ -107,7 +107,7 @@
                     <tr>
                         <th scope="row">Password</th>
                         <td>
-                            {% if object._credential_password %}
+                            {% if object.has_password %}
                                 <em class="text-muted">Set (encrypted)</em>
                             {% else %}
                                 <span class="text-muted">(global default)</span>
