@@ -1,0 +1,15 @@
+{% extends 'generic/object_edit.html' %}
+
+{% block breadcrumbs %}
+    <li class="breadcrumb-item">
+        <a href="{% url 'plugins:netbox_discovery:discoverytarget_list' %}">Discovery Targets</a>
+    </li>
+    {% if object.pk %}
+        <li class="breadcrumb-item">
+            <a href="{{ object.get_absolute_url }}">{{ object }}</a>
+        </li>
+        <li class="breadcrumb-item active">Edit</li>
+    {% else %}
+        <li class="breadcrumb-item active">Add</li>
+    {% endif %}
+{% endblock %}

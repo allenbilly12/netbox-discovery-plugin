@@ -1,0 +1,8 @@
+{% extends 'generic/object_list.html' %}
+{% load helpers %}
+
+{% block extra_controls %}
+    <a href="{% url 'plugins:netbox_discovery:discoverytarget_add' %}" class="btn btn-sm btn-success">
+        <i class="mdi mdi-plus-thick"></i> Add Target
+    </a>
+{% endblock %}

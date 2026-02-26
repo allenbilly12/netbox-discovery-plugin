@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netbox-discovery"
+version = "1.0.0"
+description = "NetBox plugin for automatic network device discovery via CDP/LLDP and NAPALM"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "NetBox Discovery Contributors", email = "noreply@example.com"}
+]
+keywords = ["netbox", "network", "discovery", "cdp", "lldp", "napalm", "plugin"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Django",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "napalm>=4.1.0",
+    "python-nmap>=0.7.1",
+    "netaddr>=0.8.0",
+    "cryptography>=42.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/netbox-discovery"
+Issues = "https://github.com/example/netbox-discovery/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["netbox_discovery*"]
+
+[tool.setuptools.package-data]
+netbox_discovery = ["templates/**/*.html"]

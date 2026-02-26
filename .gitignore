@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg-link
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Django
+*.sqlite3
+local_settings.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution
+*.whl
+*.tar.gz
+
+# Claude Code
+.claude/

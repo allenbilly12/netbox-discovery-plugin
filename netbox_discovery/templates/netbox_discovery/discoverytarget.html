@@ -1,0 +1,160 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block breadcrumbs %}
+    <li class="breadcrumb-item">
+        <a href="{% url 'plugins:netbox_discovery:discoverytarget_list' %}">Discovery Targets</a>
+    </li>
+    <li class="breadcrumb-item active">{{ object }}</li>
+{% endblock %}
+
+{% block extra_controls %}
+    {# Run Now button — submits a POST to the run endpoint #}
+    <form method="post" action="{% url 'plugins:netbox_discovery:discoverytarget_run' pk=object.pk %}" style="display:inline;">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-sm btn-success"
+            {% if not object.enabled %}disabled title="Target is disabled"{% endif %}>
+            <i class="mdi mdi-play"></i> Run Now
+        </button>
+    </form>
+    <a href="{% url 'plugins:netbox_discovery:discoverytarget_edit' pk=object.pk %}" class="btn btn-sm btn-warning">
+        <i class="mdi mdi-pencil"></i> Edit
+    </a>
+    <a href="{% url 'plugins:netbox_discovery:discoverytarget_delete' pk=object.pk %}" class="btn btn-sm btn-danger">
+        <i class="mdi mdi-trash-can-outline"></i> Delete
+    </a>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+
+    {# Left column: basic info #}
+    <div class="col col-md-6">
+        <div class="card">
+            <h5 class="card-header">Discovery Target</h5>
+            <div class="card-body">
+                <table class="table table-hover attr-table">
+                    <tr>
+                        <th scope="row">Name</th>
+                        <td>{{ object.name }}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Description</th>
+                        <td>{{ object.description|placeholder }}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Enabled</th>
+                        <td>
+                            {% if object.enabled %}
+                                <span class="badge bg-success">Yes</span>
+                            {% else %}
+                                <span class="badge bg-secondary">No</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Last Run</th>
+                        <td>{{ object.last_run|placeholder }}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Total Runs</th>
+                        <td>{{ object.runs.count }}</td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+
+        <div class="card mt-3">
+            <h5 class="card-header">Targets</h5>
+            <div class="card-body">
+                <pre class="mb-0" style="white-space: pre-wrap;">{{ object.targets }}</pre>
+            </div>
+        </div>
+    </div>
+
+    {# Right column: settings #}
+    <div class="col col-md-6">
+        <div class="card">
+            <h5 class="card-header">Connection Settings</h5>
+            <div class="card-body">
+                <table class="table table-hover attr-table">
+                    <tr>
+                        <th scope="row">NAPALM Driver</th>
+                        <td>{{ object.get_napalm_driver_display }}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Discovery Protocol</th>
+                        <td>{{ object.get_discovery_protocol_display }}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Max Depth</th>
+                        <td>{{ object.max_depth }}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">SSH Timeout</th>
+                        <td>{{ object.ssh_timeout }}s</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Username</th>
+                        <td>
+                            {% if object.credential_username %}
+                                {{ object.credential_username }}
+                            {% else %}
+                                <span class="text-muted">(global default)</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Password</th>
+                        <td>
+                            {% if object._credential_password %}
+                                <em class="text-muted">Set (encrypted)</em>
+                            {% else %}
+                                <span class="text-muted">(global default)</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+
+        <div class="card mt-3">
+            <h5 class="card-header">Scheduling</h5>
+            <div class="card-body">
+                <table class="table table-hover attr-table">
+                    <tr>
+                        <th scope="row">Auto-run Interval</th>
+                        <td>
+                            {% if object.scan_interval %}
+                                Every {{ object.scan_interval }} minutes
+                            {% else %}
+                                <span class="text-muted">Disabled</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+{# Recent runs table #}
+<div class="row mt-3">
+    <div class="col">
+        <div class="card">
+            <h5 class="card-header">
+                Recent Runs
+                <a href="{% url 'plugins:netbox_discovery:discoveryrun_list' %}?target_id={{ object.pk }}"
+                   class="btn btn-sm btn-link float-end">View All</a>
+            </h5>
+            <div class="card-body">
+                {% if recent_runs_table.rows %}
+                    {% include 'inc/table.html' with table=recent_runs_table %}
+                {% else %}
+                    <p class="text-muted">No runs yet. Click <strong>Run Now</strong> to start a discovery.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

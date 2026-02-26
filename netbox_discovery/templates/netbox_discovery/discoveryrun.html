@@ -1,0 +1,105 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block breadcrumbs %}
+    <li class="breadcrumb-item">
+        <a href="{% url 'plugins:netbox_discovery:discoveryrun_list' %}">Discovery Runs</a>
+    </li>
+    <li class="breadcrumb-item active">{{ object }}</li>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+
+    {# Summary card #}
+    <div class="col col-md-6">
+        <div class="card">
+            <h5 class="card-header">Run Summary</h5>
+            <div class="card-body">
+                <table class="table table-hover attr-table">
+                    <tr>
+                        <th scope="row">Target</th>
+                        <td><a href="{{ object.target.get_absolute_url }}">{{ object.target }}</a></td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Status</th>
+                        <td>
+                            {% if object.status == 'completed' %}
+                                <span class="badge bg-success">{{ object.get_status_display }}</span>
+                            {% elif object.status == 'failed' %}
+                                <span class="badge bg-danger">{{ object.get_status_display }}</span>
+                            {% elif object.status == 'running' %}
+                                <span class="badge bg-primary">{{ object.get_status_display }}</span>
+                            {% elif object.status == 'partial' %}
+                                <span class="badge bg-warning">{{ object.get_status_display }}</span>
+                            {% else %}
+                                <span class="badge bg-secondary">{{ object.get_status_display }}</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Started</th>
+                        <td>{{ object.started_at|placeholder }}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Completed</th>
+                        <td>{{ object.completed_at|placeholder }}</td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    {# Counters card #}
+    <div class="col col-md-6">
+        <div class="card">
+            <h5 class="card-header">Results</h5>
+            <div class="card-body">
+                <div class="row text-center">
+                    <div class="col">
+                        <div class="h2 text-info">{{ object.hosts_scanned }}</div>
+                        <small class="text-muted">Hosts Scanned</small>
+                    </div>
+                    <div class="col">
+                        <div class="h2 text-success">{{ object.devices_created }}</div>
+                        <small class="text-muted">Devices Created</small>
+                    </div>
+                    <div class="col">
+                        <div class="h2 text-primary">{{ object.devices_updated }}</div>
+                        <small class="text-muted">Devices Updated</small>
+                    </div>
+                    <div class="col">
+                        <div class="h2 {% if object.errors > 0 %}text-danger{% else %}text-muted{% endif %}">
+                            {{ object.errors }}
+                        </div>
+                        <small class="text-muted">Errors</small>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+{# Log output #}
+<div class="row mt-3">
+    <div class="col">
+        <div class="card">
+            <h5 class="card-header">
+                Job Log
+                {% if log_lines %}
+                    <span class="badge bg-secondary">{{ log_lines|length }} lines</span>
+                {% endif %}
+            </h5>
+            <div class="card-body p-0">
+                {% if log_lines %}
+                    <pre class="mb-0 p-3"
+                         style="max-height: 600px; overflow-y: auto; background: #1e1e2e; color: #cdd6f4; font-size: 0.8rem;">{% for line in log_lines %}{{ line }}
+{% endfor %}</pre>
+                {% else %}
+                    <p class="text-muted p-3">No log output available.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
