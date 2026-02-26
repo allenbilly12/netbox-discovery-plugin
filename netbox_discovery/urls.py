@@ -47,4 +47,9 @@ urlpatterns = [
         views.DiscoveryRunView.as_view(),
         name="discoveryrun",
     ),
+    path(
+        "runs/<int:pk>/delete/",
+        views.DiscoveryRunDeleteView.as_view(),
+        name="discoveryrun_delete",
+    ),
 ]

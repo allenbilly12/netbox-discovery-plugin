@@ -114,6 +114,11 @@ class DiscoveryTargetRunView(View):
 # ---------------------------------------------------------------------------
 
 
+class DiscoveryRunDeleteView(generic.ObjectDeleteView):
+    queryset = DiscoveryRun.objects.all()
+    default_return_url = "plugins:netbox_discovery:discoveryrun_list"
+
+
 class DiscoveryRunListView(generic.ObjectListView):
     queryset = DiscoveryRun.objects.select_related("target").order_by("-started_at")
     table = DiscoveryRunTable
