@@ -35,10 +35,19 @@ device facts, interfaces, IP addresses, and VLANs.
 
 ### 1. Install the plugin
 
+Clone to `/opt/netbox-discovery-plugin` on the NetBox server, then install as editable:
+
 ```bash
-pip install netbox-discovery
-# or for development:
-pip install -e /path/to/netbox-discovery-plugin
+git clone git@github.com:YOUR-ORG/netbox-discovery.git /opt/netbox-discovery-plugin
+sudo chown -R netbox:netbox /opt/netbox-discovery-plugin
+sudo /opt/netbox/venv/bin/pip install -e /opt/netbox-discovery-plugin
+```
+
+To update to the latest version:
+```bash
+cd /opt/netbox-discovery-plugin
+sudo git pull origin main
+sudo systemctl restart netbox netbox-rq
 ```
 
 ### 2. Install system dependencies
