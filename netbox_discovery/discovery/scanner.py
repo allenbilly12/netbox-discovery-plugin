@@ -112,6 +112,11 @@ def scan_targets(target_strings: List[str], log_fn: Callable = None) -> Set[str]
     """
     Expand target IPs/CIDRs and scan to find live hosts.
 
+    Individual IPs (/32) specified explicitly always bypass the scanner and
+    go straight to the crawl — the user listed them intentionally and NAPALM
+    will report a clean failure if they're unreachable.  CIDR ranges are
+    scanned first so we don't attempt NAPALM on every address in a /24.
+
     Args:
         target_strings: List of IP strings or CIDR notations.
         log_fn: Optional callable for progress messages.
@@ -122,20 +127,41 @@ def scan_targets(target_strings: List[str], log_fn: Callable = None) -> Set[str]
     if log_fn is None:
         log_fn = lambda msg: logger.info(msg)
 
-    log_fn(f"Expanding {len(target_strings)} target(s)...")
-    all_ips = _expand_targets(target_strings)
-    log_fn(f"Total IPs to scan: {len(all_ips)}")
+    # Separate explicit single IPs from CIDR ranges
+    single_ips: Set[str] = set()
+    range_targets: List[str] = []
 
-    if not all_ips:
-        log_fn("No valid IPs found in targets list — check the Targets field.")
-        return set()
+    for target in target_strings:
+        target = target.strip()
+        if not target:
+            continue
+        try:
+            net = netaddr.IPNetwork(target)
+            if net.prefixlen >= 32 or (net.version == 6 and net.prefixlen >= 128):
+                single_ips.add(str(net.ip))
+            else:
+                range_targets.append(target)
+        except netaddr.AddrFormatError:
+            logger.warning("Invalid target address: %s", target)
 
-    log_fn(f"Starting host discovery (TCP connect on ports {PROBE_PORTS})...")
-    live = _nmap_tcp_scan(all_ips, log_fn)
+    if single_ips:
+        log_fn(
+            f"{len(single_ips)} individual IP(s) will be tried directly "
+            f"(no scan needed): {sorted(single_ips)}"
+        )
 
-    if not live:
-        log_fn("nmap returned 0 hosts — retrying with pure TCP probe...")
-        live = _tcp_probe(all_ips, log_fn)
+    live: Set[str] = set(single_ips)
+
+    if range_targets:
+        range_ips = _expand_targets(range_targets)
+        log_fn(f"Scanning {len(range_ips)} IPs from {len(range_targets)} CIDR range(s)...")
+        if range_ips:
+            log_fn(f"Starting host discovery (TCP connect on ports {PROBE_PORTS})...")
+            found = _nmap_tcp_scan(range_ips, log_fn)
+            if not found:
+                log_fn("nmap returned 0 hosts — retrying with pure TCP probe...")
+                found = _tcp_probe(range_ips, log_fn)
+            live |= found
 
     log_fn(f"Host discovery complete. Live hosts: {len(live)}")
     return live
