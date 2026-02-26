@@ -38,7 +38,7 @@ class DiscoveryTargetView(generic.ObjectView):
     template_name = "netbox_discovery/discoverytarget.html"
 
     def get_extra_context(self, request, instance):
-        recent_runs = instance.runs.order_by("-started_at")[:10]
+        recent_runs = list(instance.runs.order_by("-started_at")[:10])
         run_table = DiscoveryRunTable(recent_runs)
         return {
             "recent_runs_table": run_table,
