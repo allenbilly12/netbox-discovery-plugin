@@ -3,6 +3,7 @@ NAPALM data collection from a connected device.
 
 Collects:
 - Facts (hostname, vendor, model, serial, os_version)
+- Stack members (Cisco IOS only): position, role, serial, model via show switch + show inventory
 - Interfaces (name, enabled, description, mtu, mac)
 - Interface IPs (including VLAN SVIs)
 - VLANs (if driver supports it)
@@ -10,6 +11,7 @@ Collects:
 """
 
 import logging
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -43,6 +45,7 @@ def collect_device_data(
         "interfaces_ip": {},
         "vlans": {},
         "neighbors": [],
+        "stack_members": [],
         "raw_errors": [],
     }
 
@@ -149,6 +152,20 @@ def collect_device_data(
 
     log_fn(f"    [5/5] neighbor discovery done — {len(neighbors)} total neighbors ({time.monotonic()-t0:.1f}s)")
     result["neighbors"] = neighbors
+
+    # --- Cisco Stack detection (IOS only) ---
+    log_fn("    [6/6] Checking for Cisco StackWise members...")
+    t0 = time.monotonic()
+    stack_members = _detect_cisco_stack(device, driver_name, log_fn)
+    if len(stack_members) > 1:
+        log_fn(
+            f"    [6/6] Stack detected: {len(stack_members)} member(s) "
+            f"({time.monotonic()-t0:.1f}s)"
+        )
+    else:
+        log_fn(f"    [6/6] Not a stack or not supported ({time.monotonic()-t0:.1f}s)")
+    result["stack_members"] = stack_members
+
     return result
 
 
@@ -192,6 +209,104 @@ def _get_cdp_via_cli(device, driver_name: str) -> List[Dict]:
         logger.debug("CDP CLI failed: %s", exc)
 
     return neighbors
+
+
+def _detect_cisco_stack(device, driver_name: str, log_fn: Callable) -> List[Dict]:
+    """
+    For Cisco IOS/IOS-XE devices, detect StackWise stack members via CLI.
+
+    Runs 'show switch' to get the member list (position, role, MAC, priority)
+    and 'show inventory' to get the per-member serial number and model (PID).
+
+    Returns a list of dicts — one per stack member — in position order:
+        [{"position": 1, "role": "active",  "serial": "FCW001", "model": "WS-C3850-48P", ...},
+         {"position": 2, "role": "member",  "serial": "FCW002", "model": "WS-C3850-48P", ...}]
+
+    Returns an empty list if the device is not a stack or if the commands fail.
+    Only attempted for the 'ios' driver.
+    """
+    if driver_name not in ("ios",):
+        return []
+
+    try:
+        output = device.cli(["show switch", "show inventory"])
+    except Exception as exc:
+        log_fn(f"    [stack] CLI failed: {exc}")
+        return []
+
+    members = _parse_show_switch(output.get("show switch", ""))
+    if len(members) <= 1:
+        # Single-switch or unrecognised output — not a multi-member stack
+        return members
+
+    _enrich_from_inventory(members, output.get("show inventory", ""))
+    return members
+
+
+def _parse_show_switch(output: str) -> List[Dict]:
+    """
+    Parse 'show switch' output into a list of stack member dicts.
+
+    Handles both IOS-XE and IOS formats, e.g.:
+        *1   Active   0011.2233.4401   15   V04   Ready
+         2   Member   0011.2233.4402    1   V04   Ready
+         3   Standby  0011.2233.4403    5   V04   Ready
+    """
+    members = []
+    # '*' prefix marks the active switch
+    pattern = re.compile(
+        r"^\s*\*?\s*(\d+)\s+"
+        r"(Active|Standby|Stand-by|Member|Provisioning|Waiting)\s+"
+        r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+"
+        r"(\d+)",
+        re.IGNORECASE,
+    )
+    for line in output.splitlines():
+        m = pattern.match(line)
+        if m:
+            members.append({
+                "position": int(m.group(1)),
+                "role": m.group(2).lower().replace("-", ""),
+                "mac": m.group(3),
+                "priority": int(m.group(4)),
+                "serial": "",
+                "model": "",
+            })
+    members.sort(key=lambda x: x["position"])
+    return members
+
+
+def _enrich_from_inventory(members: List[Dict], output: str) -> None:
+    """
+    Parse 'show inventory' and populate the serial/model fields in-place.
+
+    Relevant section looks like:
+        NAME: "Switch 1", DESCR: "WS-C3850-48P-E"
+        PID: WS-C3850-48P-E   , VID: V04, SN: FCW2105G00J
+
+        NAME: "Switch 2", DESCR: "WS-C3850-48P-E"
+        PID: WS-C3850-48P-E   , VID: V04, SN: FCW2048H03A
+    """
+    current_pos = None
+    name_re = re.compile(r'NAME:\s*"Switch\s+(\d+)"', re.IGNORECASE)
+    pid_sn_re = re.compile(r"PID:\s*(\S+)\s*,.*SN:\s*(\S+)", re.IGNORECASE)
+
+    for line in output.splitlines():
+        nm = name_re.search(line)
+        if nm:
+            current_pos = int(nm.group(1))
+            continue
+
+        if current_pos is not None:
+            pm = pid_sn_re.search(line)
+            if pm:
+                pid, sn = pm.group(1).strip(), pm.group(2).strip()
+                for member in members:
+                    if member["position"] == current_pos:
+                        member["model"] = pid
+                        member["serial"] = sn
+                        break
+                current_pos = None
 
 
 def _parse_cdp_neighbors(output: str) -> List[Dict]:

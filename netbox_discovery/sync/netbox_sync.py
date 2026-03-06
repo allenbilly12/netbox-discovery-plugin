@@ -135,6 +135,7 @@ def sync_device(
     interfaces_raw = data.get("interfaces", {})
     interfaces_ip = data.get("interfaces_ip", {})
     vlans_raw = data.get("vlans", {})
+    stack_members = data.get("stack_members", [])
 
     hostname = (facts.get("hostname") or mgmt_ip).strip()
     vendor = (facts.get("vendor") or "Unknown").strip()
@@ -246,6 +247,18 @@ def sync_device(
 
         # --- VLANs ---
         _sync_vlans(vlans_raw, site, log_fn)
+
+        # --- Virtual Chassis (Cisco StackWise) ---
+        if len(stack_members) > 1:
+            _sync_virtual_chassis(
+                master_device=device,
+                hostname=hostname,
+                stack_members=stack_members,
+                site=site,
+                master_dtype=dtype,
+                role=role,
+                log_fn=log_fn,
+            )
 
     action = "created" if was_created else "updated"
     log_fn(f"  Device '{hostname}' {action}.")
@@ -447,6 +460,142 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
             primary_ip, _ = IPAddress.objects.get_or_create(address=mgmt_cidr, defaults=kwargs)
 
     return primary_ip
+
+
+def _sync_virtual_chassis(
+    master_device,
+    hostname: str,
+    stack_members: List,
+    site,
+    master_dtype,
+    role,
+    log_fn: Callable,
+):
+    """
+    Create / update a VirtualChassis for a Cisco StackWise stack.
+
+    - One VirtualChassis named after the master device's hostname
+    - The master device is assigned vc_position matching its 'active' role
+    - Each additional stack member gets its own Device record (named
+      '{base_hostname}-sw{position}') with its individual serial and model,
+      and is assigned to the same VirtualChassis at its position
+    """
+    from dcim.models import Device, DeviceType, VirtualChassis
+
+    # Identify the active (master) position
+    active_entry = next(
+        (m for m in stack_members if m.get("role") in ("active", "standby")),
+        stack_members[0],
+    )
+    master_pos = active_entry["position"]
+
+    # Base name without domain (used for member device names)
+    base = hostname.split(".")[0]
+
+    # Create or get the VirtualChassis record
+    vc, vc_created = VirtualChassis.objects.get_or_create(
+        name=hostname,
+        defaults={"domain": hostname},
+    )
+    if vc_created:
+        log_fn(f"  [Stack] Created VirtualChassis '{hostname}'")
+
+    # Assign master device to VC
+    master_changed = False
+    if master_device.virtual_chassis_id != vc.pk:
+        master_device.virtual_chassis = vc
+        master_changed = True
+    if master_device.vc_position != master_pos:
+        master_device.vc_position = master_pos
+        master_changed = True
+    master_priority = active_entry.get("priority", 15)
+    if master_device.vc_priority != master_priority:
+        master_device.vc_priority = master_priority
+        master_changed = True
+    if master_changed:
+        master_device.save()
+
+    # Point VC master FK at this device
+    if vc.master_id != master_device.pk:
+        vc.master = master_device
+        vc.save()
+
+    log_fn(
+        f"  [Stack] VirtualChassis '{hostname}': {len(stack_members)} member(s), "
+        f"master at position {master_pos}"
+    )
+
+    # Sync non-master members
+    for entry in stack_members:
+        pos = entry["position"]
+        if pos == master_pos:
+            continue  # master already handled above
+
+        member_serial = (entry.get("serial") or "").strip()
+        member_model = (entry.get("model") or "").strip()
+        member_name = f"{base}-sw{pos}"
+
+        # Resolve DeviceType for this member (may differ from master if mixed-model stack)
+        member_dtype = master_dtype
+        if member_model and member_model.lower() != master_dtype.model.lower():
+            found_dt = DeviceType.objects.filter(
+                manufacturer=master_dtype.manufacturer,
+                model__iexact=member_model,
+            ).first()
+            if found_dt:
+                member_dtype = found_dt
+            else:
+                try:
+                    member_dtype, _ = DeviceType.objects.get_or_create(
+                        manufacturer=master_dtype.manufacturer,
+                        model=member_model,
+                        defaults={"slug": make_slug(f"{master_dtype.manufacturer.name}-{member_model}")},
+                    )
+                except Exception:
+                    member_dtype = master_dtype  # fallback
+
+        # Find existing member device: prefer by VC position, then by name
+        mem_dev = (
+            Device.objects.filter(virtual_chassis=vc, vc_position=pos).first()
+            or Device.objects.filter(name=member_name).first()
+        )
+
+        if mem_dev is None:
+            mem_dev = Device.objects.create(
+                name=member_name,
+                site=site,
+                device_type=member_dtype,
+                role=role,
+                serial=member_serial,
+                status="active",
+                virtual_chassis=vc,
+                vc_position=pos,
+                vc_priority=entry.get("priority", 1),
+            )
+            log_fn(
+                f"  [Stack] Created member '{member_name}' "
+                f"pos={pos} serial={member_serial or 'N/A'} model={member_model or 'N/A'}"
+            )
+        else:
+            changed = False
+            if mem_dev.virtual_chassis_id != vc.pk:
+                mem_dev.virtual_chassis = vc
+                changed = True
+            if mem_dev.vc_position != pos:
+                mem_dev.vc_position = pos
+                changed = True
+            if member_serial and mem_dev.serial != member_serial:
+                mem_dev.serial = member_serial
+                changed = True
+            if mem_dev.device_type_id != member_dtype.pk:
+                mem_dev.device_type = member_dtype
+                changed = True
+            if changed:
+                mem_dev.save()
+                log_fn(
+                    f"  [Stack] Updated member '{mem_dev.name}' "
+                    f"pos={pos} serial={member_serial or 'N/A'}"
+                )
 
 
 def _sync_vlans(vlans_raw: Dict, site, log_fn: Callable):
