@@ -62,21 +62,18 @@ class DiscoveryJob(JobRunner):
         }
         log_lines = []
         final_status = "failed"
-        _flush_counter = [0]
 
         def log_fn(msg):
             log_lines.append(msg)
             logger.info("[Discovery:%s] %s", target.name, msg)
             self._safe_log(msg)
-            # Flush log to DB every 5 lines so the UI shows live progress
-            _flush_counter[0] += 1
-            if _flush_counter[0] % 5 == 0:
-                try:
-                    run.__class__.objects.filter(pk=run.pk).update(
-                        log="\n".join(log_lines)
-                    )
-                except Exception:
-                    pass
+            # Flush every line to DB so the UI always shows the latest output
+            try:
+                run.__class__.objects.filter(pk=run.pk).update(
+                    log="\n".join(log_lines)
+                )
+            except Exception:
+                pass
 
         try:
             log_fn(f"=== Discovery started: {target.name} ===")
@@ -124,13 +121,27 @@ class DiscoveryJob(JobRunner):
             )
             counters["errors"] += crawl_summary.get("failed", 0)
 
-            log_fn(
-                f"=== Done: scanned={counters['hosts_scanned']} "
-                f"created={counters['devices_created']} "
-                f"updated={counters['devices_updated']} "
-                f"errors={counters['errors']} ==="
-            )
             final_status = "partial" if counters["errors"] > 0 else "completed"
+            log_fn("=" * 60)
+            log_fn(
+                f"=== DISCOVERY COMPLETE: {target.name} ==="
+            )
+            log_fn(
+                f"    Hosts scanned : {counters['hosts_scanned']}"
+            )
+            log_fn(
+                f"    Devices created: {counters['devices_created']}"
+            )
+            log_fn(
+                f"    Devices updated: {counters['devices_updated']}"
+            )
+            log_fn(
+                f"    Errors         : {counters['errors']}"
+            )
+            log_fn(
+                f"    Status         : {final_status.upper()}"
+            )
+            log_fn("=" * 60)
 
         except Exception as exc:
             log_fn(f"[FATAL] Job crashed: {exc}")

@@ -10,7 +10,8 @@ Collects:
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
 
@@ -19,6 +20,7 @@ def collect_device_data(
     device,
     driver_name: str,
     discovery_protocol: str = "both",
+    log_fn: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """
     Collect all available data from an open NAPALM device.
@@ -27,10 +29,14 @@ def collect_device_data(
         device: Open NAPALM driver instance.
         driver_name: The NAPALM driver name (for logging).
         discovery_protocol: 'lldp', 'cdp', or 'both'.
+        log_fn: Optional progress callback (same as job log_fn).
 
     Returns:
         Dict with keys: facts, interfaces, interfaces_ip, vlans, neighbors, raw_errors.
     """
+    if log_fn is None:
+        log_fn = lambda msg: logger.info(msg)
+
     result = {
         "facts": {},
         "interfaces": {},
@@ -41,38 +47,55 @@ def collect_device_data(
     }
 
     # --- Facts ---
+    log_fn("    [1/5] get_facts()...")
+    t0 = time.monotonic()
     try:
         result["facts"] = device.get_facts()
-        logger.debug("Got facts: hostname=%s", result["facts"].get("hostname"))
+        log_fn(f"    [1/5] get_facts() done ({time.monotonic()-t0:.1f}s) — hostname={result['facts'].get('hostname', '?')}")
     except Exception as exc:
-        msg = f"get_facts() failed: {exc}"
+        msg = f"get_facts() failed ({time.monotonic()-t0:.1f}s): {exc}"
+        log_fn(f"    [WARN] {msg}")
         logger.warning(msg)
         result["raw_errors"].append(msg)
 
     # --- Interfaces ---
+    log_fn("    [2/5] get_interfaces()...")
+    t0 = time.monotonic()
     try:
         result["interfaces"] = device.get_interfaces()
+        log_fn(f"    [2/5] get_interfaces() done ({time.monotonic()-t0:.1f}s) — {len(result['interfaces'])} interfaces")
     except Exception as exc:
-        msg = f"get_interfaces() failed: {exc}"
+        msg = f"get_interfaces() failed ({time.monotonic()-t0:.1f}s): {exc}"
+        log_fn(f"    [WARN] {msg}")
         logger.warning(msg)
         result["raw_errors"].append(msg)
 
     # --- Interface IPs (L3 + VLAN SVIs) ---
+    log_fn("    [3/5] get_interfaces_ip()...")
+    t0 = time.monotonic()
     try:
         result["interfaces_ip"] = device.get_interfaces_ip()
+        log_fn(f"    [3/5] get_interfaces_ip() done ({time.monotonic()-t0:.1f}s) — {len(result['interfaces_ip'])} L3 interfaces")
     except Exception as exc:
-        msg = f"get_interfaces_ip() failed: {exc}"
+        msg = f"get_interfaces_ip() failed ({time.monotonic()-t0:.1f}s): {exc}"
+        log_fn(f"    [WARN] {msg}")
         logger.warning(msg)
         result["raw_errors"].append(msg)
 
     # --- VLANs ---
+    log_fn("    [4/5] get_vlans()...")
+    t0 = time.monotonic()
     try:
         result["vlans"] = device.get_vlans()
+        log_fn(f"    [4/5] get_vlans() done ({time.monotonic()-t0:.1f}s) — {len(result['vlans'])} VLANs")
     except Exception as exc:
         # Many drivers don't support get_vlans(); treat as non-fatal
+        log_fn(f"    [4/5] get_vlans() not supported ({time.monotonic()-t0:.1f}s) — skipped")
         logger.debug("get_vlans() not supported or failed: %s", exc)
 
     # --- Neighbors (LLDP / CDP) ---
+    log_fn(f"    [5/5] neighbor discovery (protocol={discovery_protocol})...")
+    t0 = time.monotonic()
     neighbors = []
     if discovery_protocol in ("lldp", "both"):
         try:
@@ -89,6 +112,7 @@ def collect_device_data(
                             "remote_description": n.get("remote_system_description", ""),
                         }
                     )
+            log_fn(f"    [5/5] LLDP detail: {len(neighbors)} neighbors ({time.monotonic()-t0:.1f}s)")
         except Exception as exc:
             logger.debug("get_lldp_neighbors_detail() failed: %s", exc)
             # Try basic LLDP
@@ -106,17 +130,24 @@ def collect_device_data(
                                 "remote_description": "",
                             }
                         )
+                log_fn(f"    [5/5] LLDP basic: {len(neighbors)} neighbors ({time.monotonic()-t0:.1f}s)")
             except Exception as exc2:
+                log_fn(f"    [5/5] LLDP not available ({time.monotonic()-t0:.1f}s)")
                 logger.debug("get_lldp_neighbors() also failed: %s", exc2)
 
     if discovery_protocol in ("cdp", "both"):
         # NAPALM exposes CDP via get_lldp_neighbors on IOS; also try cli for explicit CDP
+        cdp_t0 = time.monotonic()
+        log_fn("    [5/5] CDP: running 'show cdp neighbors detail'...")
         try:
             cdp_data = _get_cdp_via_cli(device, driver_name)
             neighbors.extend(cdp_data)
+            log_fn(f"    [5/5] CDP: {len(cdp_data)} neighbors ({time.monotonic()-cdp_t0:.1f}s)")
         except Exception as exc:
+            log_fn(f"    [5/5] CDP failed ({time.monotonic()-cdp_t0:.1f}s): {exc}")
             logger.debug("CDP CLI collection failed: %s", exc)
 
+    log_fn(f"    [5/5] neighbor discovery done — {len(neighbors)} total neighbors ({time.monotonic()-t0:.1f}s)")
     result["neighbors"] = neighbors
     return result
 

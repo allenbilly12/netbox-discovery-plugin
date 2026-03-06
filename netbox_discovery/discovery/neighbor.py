@@ -8,6 +8,7 @@ up to max_depth levels deep.
 
 import logging
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .collector import collect_device_data
@@ -54,11 +55,16 @@ def crawl(
     if stop_flag is None:
         stop_flag = lambda: False
 
+    # Per-device data-collection timeout: enough headroom for all NAPALM calls
+    collect_timeout = max(timeout * 6, 60)
+
     visited: Set[str] = set()
     # Queue entries: (ip, depth)
     queue: deque = deque()
     for ip in seed_ips:
         queue.append((ip, 0))
+
+    log_fn(f"Crawl starting: {len(seed_ips)} seed IP(s), max_depth={max_depth}, collect_timeout={collect_timeout}s")
 
     summary = {
         "connected": 0,
@@ -77,7 +83,8 @@ def crawl(
 
         # Outer per-IP guard: any unhandled exception skips to the next device
         try:
-            log_fn(f"[depth={depth}] Connecting to {ip}...")
+            remaining = len(queue)
+            log_fn(f"[depth={depth}] Connecting to {ip}... (queue: {remaining} remaining, {len(visited)} visited)")
 
             device, driver_name = detect_and_connect(
                 ip=ip,
@@ -95,8 +102,23 @@ def crawl(
                 continue
 
             try:
-                log_fn(f"  [OK] Connected via '{driver_name}'. Collecting data...")
-                data = collect_device_data(device, driver_name, discovery_protocol)
+                log_fn(f"  [OK] Connected via '{driver_name}'. Collecting data (timeout={collect_timeout}s)...")
+                # Run collection in a thread with a hard wall-clock deadline so a
+                # hung NAPALM call (e.g. get_interfaces_ip on a large device) can't
+                # stall the entire crawl indefinitely.
+                executor = ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(
+                    collect_device_data, device, driver_name, discovery_protocol, log_fn
+                )
+                try:
+                    data = future.result(timeout=collect_timeout)
+                except FuturesTimeoutError:
+                    log_fn(f"  [ERROR] Data collection for {ip} timed out after {collect_timeout}s — skipping device")
+                    logger.error("collect_device_data timed out for %s", ip)
+                    summary["failed"] += 1
+                    continue
+                finally:
+                    executor.shutdown(wait=False, cancel_futures=True)
 
                 facts = data.get("facts", {})
                 hostname = facts.get("hostname", ip)
