@@ -32,7 +32,7 @@ class DiscoveryJob(JobRunner):
         from .models import DiscoveryRun, DiscoveryTarget
         from .discovery.scanner import scan_targets
         from .discovery.neighbor import crawl
-        from .sync.netbox_sync import sync_device
+        from .sync.netbox_sync import sync_device, sync_cables
 
         target_id = data.get("target_id")
         if not target_id:
@@ -71,7 +71,8 @@ class DiscoveryJob(JobRunner):
         }
         log_lines = []
         device_results = []  # [{ip, hostname, status, driver, error}]
-        log_lock = threading.Lock()  # guards log_lines, counters, device_results
+        neighbor_records = []  # [{hostname, neighbors}] — for post-crawl cable sync
+        log_lock = threading.Lock()  # guards log_lines, counters, device_results, neighbor_records
         final_status = "failed"
 
         def log_fn(msg):
@@ -117,6 +118,10 @@ class DiscoveryJob(JobRunner):
                             "status": status,
                             "driver": driver_name,
                         })
+                        neighbor_records.append({
+                            "hostname": device_name,
+                            "neighbors": device_data.get("neighbors", []),
+                        })
                         if was_created:
                             counters["devices_created"] += 1
                         else:
@@ -158,6 +163,17 @@ class DiscoveryJob(JobRunner):
             )
             counters["errors"] += crawl_summary.get("failed", 0)
 
+            # Step 3: cable sync — wire up CDP/LLDP connections post-crawl
+            cables_created = 0
+            if neighbor_records:
+                log_fn("--- Cable sync (CDP/LLDP neighbors) ---")
+                try:
+                    cables_created = sync_cables(neighbor_records, log_fn=log_fn)
+                except Exception as exc:
+                    log_fn(f"  [Cable] sync_cables error: {exc}")
+                    logger.exception("sync_cables error for target %s", target.name)
+            counters["cables_created"] = cables_created
+
             final_status = "partial" if counters["errors"] > 0 else "completed"
             log_fn("=" * 60)
             log_fn(
@@ -171,6 +187,9 @@ class DiscoveryJob(JobRunner):
             )
             log_fn(
                 f"    Devices updated: {counters['devices_updated']}"
+            )
+            log_fn(
+                f"    Cables created : {cables_created}"
             )
             log_fn(
                 f"    Errors         : {counters['errors']}"

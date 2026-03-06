@@ -666,3 +666,152 @@ def _sync_vlans(vlans_raw: Dict, site, log_fn: Callable):
             # Update auto-generated names with the real name
             vlan.name = vlan_name
             vlan.save()
+
+
+# ---------------------------------------------------------------------------
+# Cable / connection sync (post-crawl)
+# ---------------------------------------------------------------------------
+
+# Map common CDP/LLDP abbreviated interface name prefixes to full names.
+# Sorted longest-first so "twe" is tried before "te".
+_IFACE_EXPANSIONS = [
+    ("twe", "twentyfivegigabitethernet"),
+    ("hundredgige", "hundredgigabitethernet"),
+    ("hundredge", "hundredgigabitethernet"),
+    ("fortygige", "fortygigabitethernet"),
+    ("tengige", "tengigabitethernet"),
+    ("gigabitethernet", "gigabitethernet"),   # already full — keep for identity
+    ("fastethernet", "fastethernet"),
+    ("hu", "hundredgigabitethernet"),
+    ("fo", "fortygigabitethernet"),
+    ("te", "tengigabitethernet"),
+    ("gi", "gigabitethernet"),
+    ("ge", "gigabitethernet"),
+    ("fa", "fastethernet"),
+    ("et", "ethernet"),
+    ("po", "port-channel"),
+    ("ae", "port-channel"),
+    ("mg", "management"),
+    ("ma", "management"),
+    ("lo", "loopback"),
+]
+
+
+def _find_device_by_hostname(hostname: str):
+    """Look up a NetBox Device by hostname, with domain-variant fallback."""
+    from dcim.models import Device
+    from django.db.models import Q
+
+    if not hostname:
+        return None
+    device = Device.objects.filter(name=hostname).first()
+    if device:
+        return device
+    base = _base_hostname(hostname)
+    if base:
+        device = Device.objects.filter(
+            Q(name__iexact=base) | Q(name__istartswith=base + ".")
+        ).first()
+    return device
+
+
+def _find_interface(device, name: str):
+    """
+    Look up a NetBox Interface on *device* by name.
+    Tries exact match first, then expands common CDP/LLDP abbreviations.
+    """
+    from dcim.models import Interface
+
+    if not name:
+        return None
+
+    iface = Interface.objects.filter(device=device, name__iexact=name).first()
+    if iface:
+        return iface
+
+    lower = name.lower()
+    for abbrev, full in _IFACE_EXPANSIONS:
+        if lower.startswith(abbrev) and not lower.startswith(full):
+            expanded = full + lower[len(abbrev):]
+            iface = Interface.objects.filter(device=device, name__iexact=expanded).first()
+            if iface:
+                return iface
+    return None
+
+
+def sync_cables(neighbor_records: List[Dict], log_fn: Optional[Callable] = None) -> int:
+    """
+    Create NetBox Cable objects from collected CDP/LLDP neighbor data.
+
+    Should be called once after all devices have been synced (post-crawl),
+    so both endpoints are guaranteed to exist in NetBox.
+
+    Returns the count of new cables created.
+    """
+    from dcim.models import Cable
+    from django.db import IntegrityError, transaction
+
+    if log_fn is None:
+        log_fn = lambda msg: logger.info(msg)
+
+    created = 0
+    # frozenset of (iface_pk_a, iface_pk_b) — deduplicates A→B / B→A within this run
+    seen: set = set()
+
+    for record in neighbor_records:
+        local_hostname = record.get("hostname", "")
+        local_device = _find_device_by_hostname(local_hostname)
+        if not local_device:
+            continue
+
+        for nbr in record.get("neighbors", []):
+            local_iface_name = nbr.get("local_interface", "")
+            remote_hostname = nbr.get("remote_hostname", "")
+            remote_iface_name = nbr.get("remote_interface", "")
+
+            if not local_iface_name or not remote_hostname or not remote_iface_name:
+                continue
+
+            local_iface = _find_interface(local_device, local_iface_name)
+            if not local_iface:
+                continue
+
+            remote_device = _find_device_by_hostname(remote_hostname)
+            if not remote_device:
+                continue
+
+            remote_iface = _find_interface(remote_device, remote_iface_name)
+            if not remote_iface:
+                continue
+
+            # Skip if either interface is already cabled
+            if local_iface.cable_id or remote_iface.cable_id:
+                continue
+
+            # Deduplicate bidirectional reports (A→B seen from both A and B)
+            key = frozenset({local_iface.pk, remote_iface.pk})
+            if key in seen:
+                continue
+            seen.add(key)
+
+            try:
+                with transaction.atomic():
+                    cable = Cable(
+                        a_terminations=[local_iface],
+                        b_terminations=[remote_iface],
+                        status="connected",
+                    )
+                    cable.full_clean()
+                    cable.save()
+                    created += 1
+                    log_fn(
+                        f"  [Cable] {local_device.name}/{local_iface.name}"
+                        f" ↔ {remote_device.name}/{remote_iface.name}"
+                    )
+            except (IntegrityError, Exception) as exc:
+                log_fn(
+                    f"  [Cable] SKIP {local_device.name}/{local_iface.name}"
+                    f" ↔ {remote_device.name}/{remote_iface.name}: {exc}"
+                )
+
+    return created
