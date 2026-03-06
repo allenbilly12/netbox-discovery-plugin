@@ -19,6 +19,25 @@ logger = logging.getLogger("netbox.plugins.netbox_discovery")
 # pyeapi uses HTTP and produces noisy ConnectionRefusedError on non-Arista devices
 DETECTION_ORDER = ["ios", "nxos_ssh", "junos", "fortios", "eos"]
 
+# Hostnames that indicate the wrong driver parsed the device's CLI output.
+# For example, the IOS driver connecting to NX-OS returns "Kernel" from the
+# Linux kernel banner that NX-OS exposes before the NX-OS prompt.
+_GARBAGE_HOSTNAMES = {
+    "kernel", "localhost", "linux", "ubuntu", "debian", "centos", "redhat",
+    "router", "switch", "firewall",
+}
+
+
+def _looks_like_ip(s: str) -> bool:
+    """Return True if s looks like an IPv4 address (four dot-separated octets)."""
+    parts = s.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except ValueError:
+        return False
+
 
 def _try_driver(
     driver_name: str,
@@ -63,7 +82,24 @@ def _try_driver(
             optional_args=optional_args,
         )
         device.open()
-        device.get_facts()
+        facts = device.get_facts()
+
+        # Validate the hostname returned by get_facts(). Some drivers (e.g. IOS)
+        # successfully connect to NX-OS devices but misparse the CLI and return
+        # garbage like "Kernel". Treat that as a detection failure so we fall
+        # through to the correct driver (nxos_ssh).
+        reported_hostname = (facts.get("hostname") or "").strip().lower()
+        if reported_hostname in _GARBAGE_HOSTNAMES or reported_hostname.startswith("^") or _looks_like_ip(reported_hostname):
+            log_fn(
+                f"    Driver '{driver_name}' connected but returned garbage hostname "
+                f"'{facts.get('hostname')}' — skipping (likely wrong driver for this OS)"
+            )
+            try:
+                device.close()
+            except Exception:
+                pass
+            return None
+
         return device
 
     except Exception as exc:
