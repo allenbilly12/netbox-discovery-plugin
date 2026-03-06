@@ -119,13 +119,28 @@ class MergeDevicesView(View):
         if changed:
             keeper.save()
 
-        # If duplicate was the VC master, promote keeper as the new master
-        if dup_vc and dup_vc.master_id == duplicate.pk:
-            dup_vc.master = keeper
-            dup_vc.save()
+        # Resolve the VC the duplicate currently belongs to (re-fetch to avoid stale cache).
+        # This must happen regardless of whether we transferred the VC above.
+        dup_vc_fresh = (
+            duplicate.virtual_chassis.__class__.objects.filter(pk=duplicate.virtual_chassis_id).first()
+            if duplicate.virtual_chassis_id
+            else None
+        )
+        if dup_vc_fresh:
+            # If duplicate is currently the VC master, reassign master before we delete it.
+            if dup_vc_fresh.master_id == duplicate.pk:
+                # Prefer the keeper (now a VC member) or fall back to any other member.
+                new_master = (
+                    keeper
+                    if keeper.virtual_chassis_id == dup_vc_fresh.pk
+                    else Device.objects.filter(virtual_chassis=dup_vc_fresh)
+                         .exclude(pk=duplicate.pk)
+                         .first()
+                )
+                dup_vc_fresh.master = new_master
+                dup_vc_fresh.save()
 
-        # Detach duplicate from VC before deletion to avoid FK constraint issues
-        if duplicate.virtual_chassis:
+            # Detach duplicate from VC before deletion to avoid FK constraint errors.
             duplicate.virtual_chassis = None
             duplicate.vc_position = None
             duplicate.vc_priority = None
