@@ -6,10 +6,48 @@ Matches existing devices by hostname first, then by primary IP.
 """
 
 import logging
+import logging.handlers
+import os
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
+
+# ---------------------------------------------------------------------------
+# Dedicated conflict logger — writes to /var/log/netbox/discovery_conflicts.log
+# so IP assignment issues can be reviewed and corrected independently of the
+# main NetBox log.
+# ---------------------------------------------------------------------------
+
+def _get_conflict_logger() -> logging.Logger:
+    """Return (creating on first call) the dedicated IP-conflict file logger."""
+    name = "netbox.plugins.netbox_discovery.conflicts"
+    clog = logging.getLogger(name)
+    if clog.handlers:
+        return clog  # already configured
+
+    clog.setLevel(logging.WARNING)
+    clog.propagate = False  # don't bubble up into the main NetBox log
+
+    log_path = "/var/log/netbox/discovery_conflicts.log"
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            log_path,
+            maxBytes=5 * 1024 * 1024,  # 5 MB per file
+            backupCount=5,
+            encoding="utf-8",
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        clog.addHandler(handler)
+    except OSError as exc:
+        # If the log directory isn't writable, fall back to the main logger
+        logger.warning("Cannot open conflict log %s: %s — conflicts will appear in main log only", log_path, exc)
+        clog.addHandler(logging.NullHandler())
+
+    return clog
 
 # ---------------------------------------------------------------------------
 # Interface type mapping
@@ -177,9 +215,27 @@ def sync_device(
             # if another device already owns this IP as primary, skip rather than crash.
             conflict = Device.objects.filter(primary_ip4=primary_ip).exclude(pk=device.pk).first()
             if conflict:
-                log_fn(
-                    f"  [WARN] Cannot set primary IP {primary_ip} on '{hostname}': "
-                    f"already primary on '{conflict.name}' — skipping"
+                # Gather extra context: what interface is the IP currently assigned to?
+                assigned_iface = primary_ip.assigned_object
+                assigned_desc = (
+                    f"{assigned_iface.device.name}/{assigned_iface.name}"
+                    if assigned_iface and hasattr(assigned_iface, "device")
+                    else str(assigned_iface) if assigned_iface else "unassigned"
+                )
+                warn_msg = (
+                    f"  [WARN] Primary IP conflict — cannot assign {primary_ip} to '{hostname}' "
+                    f"(mgmt={mgmt_ip}): already primary on '{conflict.name}' "
+                    f"(id={conflict.pk}, site={conflict.site}). "
+                    f"IP currently assigned to interface: {assigned_desc}."
+                )
+                log_fn(warn_msg)
+                _get_conflict_logger().warning(
+                    "PRIMARY IP CONFLICT | wanted_device=%s (id=%s, mgmt=%s) | "
+                    "blocking_device=%s (id=%s, site=%s) | "
+                    "ip=%s (id=%s) | ip_assigned_to=%s",
+                    hostname, device.pk, mgmt_ip,
+                    conflict.name, conflict.pk, conflict.site,
+                    primary_ip, primary_ip.pk, assigned_desc,
                 )
             else:
                 device.primary_ip4 = primary_ip
