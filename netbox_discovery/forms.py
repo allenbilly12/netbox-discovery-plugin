@@ -40,6 +40,7 @@ class DiscoveryTargetForm(NetBoxModelForm):
             "discovery_protocol",
             "max_depth",
             "ssh_timeout",
+            "max_workers",
             name="Discovery Settings",
         ),
         FieldSet("scan_interval", "enabled", name="Scheduling"),
@@ -59,6 +60,7 @@ class DiscoveryTargetForm(NetBoxModelForm):
             "discovery_protocol",
             "max_depth",
             "ssh_timeout",
+            "max_workers",
             "scan_interval",
             "enabled",
             "tags",
@@ -67,6 +69,7 @@ class DiscoveryTargetForm(NetBoxModelForm):
             "targets": forms.Textarea(attrs={"rows": 6, "placeholder": "10.0.0.1\n192.168.1.0/24"}),
             "max_depth": forms.NumberInput(attrs={"min": 0, "max": 10}),
             "ssh_timeout": forms.NumberInput(attrs={"min": 1, "max": 120}),
+            "max_workers": forms.NumberInput(attrs={"min": 1, "max": 50}),
             "scan_interval": forms.NumberInput(attrs={"min": 0}),
         }
 

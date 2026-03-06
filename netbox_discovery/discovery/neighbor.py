@@ -4,10 +4,15 @@ BFS (breadth-first search) recursive neighbor crawler.
 Starting from seed IPs, connects to each device, collects data,
 then enqueues newly discovered neighbor IPs for further processing
 up to max_depth levels deep.
+
+Devices are processed in parallel using a thread pool (max_workers).
+Django ORM is thread-safe — each thread gets its own DB connection
+from the pool automatically.
 """
 
 import logging
-from collections import deque
+import queue as _queue_mod
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -29,9 +34,10 @@ def crawl(
     on_device_data: Optional[Callable[[str, Dict[str, Any], str], None]] = None,
     log_fn: Optional[Callable[[str], None]] = None,
     stop_flag: Optional[Callable[[], bool]] = None,
+    max_workers: int = 5,
 ) -> Dict[str, Any]:
     """
-    BFS crawl starting from seed_ips, following LLDP/CDP neighbors.
+    Concurrent BFS crawl starting from seed_ips, following LLDP/CDP neighbors.
 
     Args:
         seed_ips: Starting set of live IP addresses.
@@ -44,8 +50,9 @@ def crawl(
         on_device_data: Callback invoked with (ip, device_data_dict, driver_name)
                         for each successfully collected device. Typically writes
                         to NetBox.
-        log_fn: Optional log/progress callback.
+        log_fn: Optional log/progress callback (must be thread-safe).
         stop_flag: Optional callable that returns True to abort early.
+        max_workers: Number of devices to process in parallel.
 
     Returns:
         Summary dict with counts.
@@ -58,19 +65,13 @@ def crawl(
     # Per-device data-collection timeout: enough headroom for all NAPALM calls
     collect_timeout = max(timeout * 6, 60)
 
+    # Thread-safe work queue; each item is (ip, depth) or None (poison pill).
+    work_queue: _queue_mod.Queue = _queue_mod.Queue()
+
+    # Lock protects all shared mutable state.
+    lock = threading.Lock()
     visited: Set[str] = set()
-    # queued tracks every IP ever added to the queue so we never enqueue the
-    # same IP twice — visited alone isn't sufficient because it's only updated
-    # when an IP is *dequeued*, allowing the same IP to accumulate in the queue
-    # as a neighbor of multiple devices before it's first processed.
-    queued: Set[str] = set(seed_ips)
-    # Queue entries: (ip, depth)
-    queue: deque = deque()
-    for ip in seed_ips:
-        queue.append((ip, 0))
-
-    log_fn(f"Crawl starting: {len(seed_ips)} seed IP(s), max_depth={max_depth}, collect_timeout={collect_timeout}s")
-
+    queued: Set[str] = set(seed_ips)  # IPs ever enqueued — prevents duplicates
     summary = {
         "connected": 0,
         "failed": 0,
@@ -78,100 +79,176 @@ def crawl(
         "neighbors_queued": 0,
     }
 
-    while queue and not stop_flag():
-        ip, depth = queue.popleft()
+    for ip in seed_ips:
+        work_queue.put((ip, 0))
 
-        if ip in visited:
-            summary["skipped"] += 1
-            continue
-        visited.add(ip)
+    actual_workers = min(max_workers, max(1, len(seed_ips)))
+    log_fn(
+        f"Crawl starting: {len(seed_ips)} seed IP(s), max_depth={max_depth}, "
+        f"workers={actual_workers}, collect_timeout={collect_timeout}s"
+    )
 
-        # Outer per-IP guard: any unhandled exception skips to the next device
+    def worker():
+        # Each thread needs its own Django DB connection released on exit.
         try:
-            remaining = len(queue)
-            log_fn(f"[depth={depth}] Connecting to {ip}... (queue: {remaining} remaining, {len(visited)} visited)")
+            from django.db import connection as _db_conn
+        except ImportError:
+            _db_conn = None
 
-            device, driver_name = detect_and_connect(
-                ip=ip,
-                username=username,
-                password=password,
-                enable_secret=enable_secret,
-                timeout=timeout,
-                preferred_driver=preferred_driver,
-                log_fn=log_fn,
-            )
+        try:
+            while True:
+                item = work_queue.get()
 
-            if device is None:
-                log_fn(f"  [FAILED] {ip} — could not connect with any driver. Skipping.")
-                summary["failed"] += 1
-                continue
+                # Poison pill — time to exit.
+                if item is None:
+                    work_queue.task_done()
+                    break
 
-            try:
-                log_fn(f"  [OK] Connected via '{driver_name}'. Collecting data (timeout={collect_timeout}s)...")
-                # Run collection in a thread with a hard wall-clock deadline so a
-                # hung NAPALM call (e.g. get_interfaces_ip on a large device) can't
-                # stall the entire crawl indefinitely.
-                executor = ThreadPoolExecutor(max_workers=1)
-                future = executor.submit(
-                    collect_device_data, device, driver_name, discovery_protocol, log_fn
-                )
+                ip, depth = item
                 try:
-                    data = future.result(timeout=collect_timeout)
-                except FuturesTimeoutError:
-                    log_fn(f"  [ERROR] Data collection for {ip} timed out after {collect_timeout}s — skipping device")
-                    logger.error("collect_device_data timed out for %s", ip)
-                    summary["failed"] += 1
-                    continue
-                finally:
-                    executor.shutdown(wait=False, cancel_futures=True)
+                    if stop_flag():
+                        with lock:
+                            summary["skipped"] += 1
+                        continue
 
-                facts = data.get("facts", {})
-                hostname = facts.get("hostname", ip)
-                log_fn(
-                    f"  Hostname: {hostname} | Vendor: {facts.get('vendor', '?')} "
-                    f"| Model: {facts.get('model', '?')} | Serial: {facts.get('serial_number', '?')}"
-                )
+                    with lock:
+                        if ip in visited:
+                            summary["skipped"] += 1
+                            continue
+                        visited.add(ip)
+                        n_visited = len(visited)
 
-                if data.get("raw_errors"):
-                    for err in data["raw_errors"]:
-                        log_fn(f"  [WARN] {err}")
+                    remaining = work_queue.qsize()
+                    log_fn(
+                        f"[depth={depth}] Connecting to {ip}... "
+                        f"(queue≈{remaining}, visited={n_visited})"
+                    )
 
-                # NetBox sync
-                if on_device_data:
+                    device, driver_name = detect_and_connect(
+                        ip=ip,
+                        username=username,
+                        password=password,
+                        enable_secret=enable_secret,
+                        timeout=timeout,
+                        preferred_driver=preferred_driver,
+                        log_fn=log_fn,
+                    )
+
+                    if device is None:
+                        log_fn(f"  [FAILED] {ip} — could not connect with any driver. Skipping.")
+                        with lock:
+                            summary["failed"] += 1
+                        continue
+
                     try:
-                        on_device_data(ip, data, driver_name)
+                        log_fn(
+                            f"  [OK] Connected via '{driver_name}'. "
+                            f"Collecting data (timeout={collect_timeout}s)..."
+                        )
+                        # Hard wall-clock deadline so a hung NAPALM call can't
+                        # stall this worker thread indefinitely.
+                        executor = ThreadPoolExecutor(max_workers=1)
+                        future = executor.submit(
+                            collect_device_data, device, driver_name, discovery_protocol, log_fn
+                        )
+                        try:
+                            data = future.result(timeout=collect_timeout)
+                        except FuturesTimeoutError:
+                            log_fn(
+                                f"  [ERROR] Data collection for {ip} timed out "
+                                f"after {collect_timeout}s — skipping device"
+                            )
+                            logger.error("collect_device_data timed out for %s", ip)
+                            with lock:
+                                summary["failed"] += 1
+                            continue
+                        finally:
+                            executor.shutdown(wait=False, cancel_futures=True)
+
+                        facts = data.get("facts", {})
+                        hostname = facts.get("hostname", ip)
+                        log_fn(
+                            f"  Hostname: {hostname} | Vendor: {facts.get('vendor', '?')} "
+                            f"| Model: {facts.get('model', '?')} | Serial: {facts.get('serial_number', '?')}"
+                        )
+
+                        if data.get("raw_errors"):
+                            for err in data["raw_errors"]:
+                                log_fn(f"  [WARN] {err}")
+
+                        # NetBox sync
+                        if on_device_data:
+                            try:
+                                on_device_data(ip, data, driver_name)
+                            except Exception as exc:
+                                log_fn(f"  [ERROR] NetBox sync failed for {ip}: {exc} — continuing")
+                                logger.exception("Sync error for %s", ip)
+
+                        with lock:
+                            summary["connected"] += 1
+
+                        # Enqueue neighbors
+                        if depth < max_depth:
+                            new_ips = _extract_neighbor_ips(data.get("neighbors", []))
+                            for neighbor_ip in new_ips:
+                                enqueue = False
+                                with lock:
+                                    if neighbor_ip and neighbor_ip not in queued:
+                                        queued.add(neighbor_ip)
+                                        enqueue = True
+                                    elif neighbor_ip in queued and neighbor_ip not in visited:
+                                        log_fn(
+                                            f"  Neighbor {neighbor_ip} already queued — skipping duplicate"
+                                        )
+                                if enqueue:
+                                    log_fn(f"  Queuing neighbor: {neighbor_ip} (depth={depth + 1})")
+                                    work_queue.put((neighbor_ip, depth + 1))
+                                    with lock:
+                                        summary["neighbors_queued"] += 1
+
                     except Exception as exc:
-                        log_fn(f"  [ERROR] NetBox sync failed for {ip}: {exc} — continuing")
-                        logger.exception("Sync error for %s", ip)
+                        log_fn(f"  [ERROR] Data collection failed for {ip}: {exc} — skipping device")
+                        logger.exception("Collection error for %s", ip)
+                        with lock:
+                            summary["failed"] += 1
+                    finally:
+                        try:
+                            device.close()
+                        except Exception:
+                            pass
 
-                summary["connected"] += 1
+                except Exception as exc:
+                    log_fn(f"[ERROR] Unexpected error processing {ip}: {exc} — continuing")
+                    logger.exception("Unexpected crawl error for %s", ip)
+                    with lock:
+                        summary["failed"] += 1
+                finally:
+                    work_queue.task_done()
 
-                # Enqueue neighbors
-                if depth < max_depth:
-                    new_ips = _extract_neighbor_ips(data.get("neighbors", []))
-                    for neighbor_ip in new_ips:
-                        if neighbor_ip and neighbor_ip not in queued:
-                            log_fn(f"  Queuing neighbor: {neighbor_ip} (depth={depth + 1})")
-                            queue.append((neighbor_ip, depth + 1))
-                            queued.add(neighbor_ip)
-                            summary["neighbors_queued"] += 1
-                        elif neighbor_ip in queued and neighbor_ip not in visited:
-                            log_fn(f"  Neighbor {neighbor_ip} already queued — skipping duplicate")
-
-            except Exception as exc:
-                log_fn(f"  [ERROR] Data collection failed for {ip}: {exc} — skipping device")
-                logger.exception("Collection error for %s", ip)
-                summary["failed"] += 1
-            finally:
+        finally:
+            # Release this thread's Django DB connection back to the pool.
+            if _db_conn is not None:
                 try:
-                    device.close()
+                    _db_conn.close()
                 except Exception:
                     pass
 
-        except Exception as exc:
-            log_fn(f"[ERROR] Unexpected error processing {ip}: {exc} — continuing")
-            logger.exception("Unexpected crawl error for %s", ip)
-            summary["failed"] += 1
+    # Start worker threads.
+    threads = [
+        threading.Thread(target=worker, daemon=True, name=f"discovery-worker-{i}")
+        for i in range(actual_workers)
+    ]
+    for t in threads:
+        t.start()
+
+    # Block until every item (including dynamically enqueued neighbors) is done.
+    work_queue.join()
+
+    # Send poison pills so workers exit their blocking get() calls.
+    for _ in range(actual_workers):
+        work_queue.put(None)
+    for t in threads:
+        t.join(timeout=5)
 
     log_fn(
         f"Crawl complete. Connected: {summary['connected']}, "

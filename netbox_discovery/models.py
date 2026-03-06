@@ -106,6 +106,10 @@ class DiscoveryTarget(NetBoxModel):
         default=10,
         help_text="SSH connection timeout in seconds.",
     )
+    max_workers = models.PositiveIntegerField(
+        default=5,
+        help_text="Number of devices to crawl in parallel. Increase for faster discovery on large networks.",
+    )
 
     # Scheduling
     scan_interval = models.PositiveIntegerField(

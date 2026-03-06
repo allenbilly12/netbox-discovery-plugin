@@ -7,6 +7,7 @@ discovery_scheduler: system_job that fires every N minutes and enqueues
 """
 
 import logging
+import threading
 
 from django.conf import settings
 from django.utils import timezone
@@ -69,17 +70,18 @@ class DiscoveryJob(JobRunner):
             "errors": 0,
         }
         log_lines = []
+        log_lock = threading.Lock()  # guards log_lines for concurrent workers
         final_status = "failed"
 
         def log_fn(msg):
-            log_lines.append(msg)
+            with log_lock:
+                log_lines.append(msg)
+                snapshot = "\n".join(log_lines)
             logger.info("[Discovery:%s] %s", target.name, msg)
             self._safe_log(msg)
             # Flush every line to DB so the UI always shows the latest output
             try:
-                run.__class__.objects.filter(pk=run.pk).update(
-                    log="\n".join(log_lines)
-                )
+                run.__class__.objects.filter(pk=run.pk).update(log=snapshot)
             except Exception:
                 pass
 
@@ -106,14 +108,16 @@ class DiscoveryJob(JobRunner):
                         holding_site_name=holding_site,
                         log_fn=log_fn,
                     )
-                    if was_created:
-                        counters["devices_created"] += 1
-                    else:
-                        counters["devices_updated"] += 1
+                    with log_lock:
+                        if was_created:
+                            counters["devices_created"] += 1
+                        else:
+                            counters["devices_updated"] += 1
                 except Exception as exc:
                     log_fn(f"  [ERROR] Sync failed for {ip}: {exc}")
                     logger.exception("sync_device error for %s", ip)
-                    counters["errors"] += 1
+                    with log_lock:
+                        counters["errors"] += 1
 
             crawl_summary = crawl(
                 seed_ips=live_ips,
@@ -126,6 +130,7 @@ class DiscoveryJob(JobRunner):
                 discovery_protocol=target.discovery_protocol,
                 on_device_data=on_device,
                 log_fn=log_fn,
+                max_workers=target.max_workers,
             )
             counters["errors"] += crawl_summary.get("failed", 0)
 
