@@ -15,8 +15,9 @@ from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
 
-# Detection order: Cisco-first per user preference, then others
-DETECTION_ORDER = ["ios", "nxos_ssh", "eos", "junos", "fortios"]
+# Detection order: Cisco-first per user preference, EOS last since
+# pyeapi uses HTTP and produces noisy ConnectionRefusedError on non-Arista devices
+DETECTION_ORDER = ["ios", "nxos_ssh", "junos", "fortios", "eos"]
 
 
 def _try_driver(

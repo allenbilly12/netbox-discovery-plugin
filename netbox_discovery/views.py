@@ -96,9 +96,11 @@ class DiscoveryTargetRunView(View):
         try:
             from .jobs import DiscoveryJob
 
+            from .jobs import JOB_TIMEOUT
             DiscoveryJob.enqueue(
                 data={"target_id": target.pk},
                 name=f"Discovery: {target.name}",
+                job_timeout=JOB_TIMEOUT,
             )
             messages.success(
                 request,

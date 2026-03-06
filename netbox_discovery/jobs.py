@@ -15,6 +15,10 @@ from netbox.jobs import JobRunner
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
 
 
+# 1 hour — large enough for any realistic crawl
+JOB_TIMEOUT = 3600
+
+
 class DiscoveryJob(JobRunner):
     """
     NetBox background job that runs a full discovery cycle for one DiscoveryTarget.
@@ -22,6 +26,9 @@ class DiscoveryJob(JobRunner):
 
     class Meta:
         name = "Network Discovery"
+        # Tell RQ/NetBox to allow up to 1 hour before killing the worker process.
+        # The default (300 s) is far too short for multi-device crawls.
+        job_timeout = JOB_TIMEOUT
 
     def run(self, data, commit=True):
         from .models import DiscoveryRun, DiscoveryTarget
@@ -39,6 +46,10 @@ class DiscoveryJob(JobRunner):
         except DiscoveryTarget.DoesNotExist:
             self._safe_log(f"DiscoveryTarget {target_id} not found")
             return
+
+        # Clean up any runs that were left in 'running' state by a previously
+        # killed worker process (SIGKILL bypasses our finally block).
+        _reap_stale_runs(target)
 
         # Create run record
         run = DiscoveryRun.objects.create(
@@ -197,6 +208,30 @@ def _update_last_run(target):
         logger.error("Failed to update last_run for target %s: %s", target.pk, exc)
 
 
+def _reap_stale_runs(target):
+    """
+    Mark any DiscoveryRun for this target that is still 'running' after more
+    than JOB_TIMEOUT seconds as 'failed'.  This handles the case where a
+    previous worker was killed (SIGKILL) before its finally block could run.
+    """
+    from datetime import timedelta
+    from .models import DiscoveryRun
+
+    cutoff = timezone.now() - timedelta(seconds=JOB_TIMEOUT)
+    stale = DiscoveryRun.objects.filter(
+        target=target, status="running", started_at__lt=cutoff
+    )
+    count = stale.update(
+        status="failed",
+        completed_at=timezone.now(),
+        log="[Job killed by RQ worker timeout — no final log available]",
+    )
+    if count:
+        logger.warning(
+            "Reaped %d stale run(s) for target '%s'", count, target.name
+        )
+
+
 # ---------------------------------------------------------------------------
 # Periodic scheduler (system_job)
 # ---------------------------------------------------------------------------
@@ -226,7 +261,7 @@ try:
                     target.name,
                     target.scan_interval,
                 )
-                DiscoveryJob.enqueue(data={"target_id": target.pk})
+                DiscoveryJob.enqueue(data={"target_id": target.pk}, job_timeout=JOB_TIMEOUT)
 
 except ImportError:
     logger.warning(
