@@ -218,6 +218,9 @@ class DiscoveryRun(NetBoxModel):
     # Full log output stored as text
     log = models.TextField(blank=True)
 
+    # Structured per-device results: list of {ip, hostname, status, driver, error}
+    device_results = models.JSONField(default=list, blank=True)
+
     class Meta:
         ordering = ["-started_at"]
         verbose_name = "Discovery Run"

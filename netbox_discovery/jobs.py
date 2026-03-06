@@ -70,7 +70,8 @@ class DiscoveryJob(JobRunner):
             "errors": 0,
         }
         log_lines = []
-        log_lock = threading.Lock()  # guards log_lines for concurrent workers
+        device_results = []  # [{ip, hostname, status, driver, error}]
+        log_lock = threading.Lock()  # guards log_lines, counters, device_results
         final_status = "failed"
 
         def log_fn(msg):
@@ -109,6 +110,13 @@ class DiscoveryJob(JobRunner):
                         log_fn=log_fn,
                     )
                     with log_lock:
+                        status = "created" if was_created else "updated"
+                        device_results.append({
+                            "ip": ip,
+                            "hostname": device_name,
+                            "status": status,
+                            "driver": driver_name,
+                        })
                         if was_created:
                             counters["devices_created"] += 1
                         else:
@@ -117,7 +125,22 @@ class DiscoveryJob(JobRunner):
                     log_fn(f"  [ERROR] Sync failed for {ip}: {exc}")
                     logger.exception("sync_device error for %s", ip)
                     with log_lock:
+                        device_results.append({
+                            "ip": ip,
+                            "hostname": None,
+                            "status": "failed",
+                            "error": str(exc),
+                        })
                         counters["errors"] += 1
+
+            def on_device_failed(ip, error):
+                with log_lock:
+                    device_results.append({
+                        "ip": ip,
+                        "hostname": None,
+                        "status": "failed",
+                        "error": error,
+                    })
 
             crawl_summary = crawl(
                 seed_ips=live_ips,
@@ -129,6 +152,7 @@ class DiscoveryJob(JobRunner):
                 max_depth=target.max_depth,
                 discovery_protocol=target.discovery_protocol,
                 on_device_data=on_device,
+                on_device_failed=on_device_failed,
                 log_fn=log_fn,
                 max_workers=target.max_workers,
             )
@@ -164,7 +188,7 @@ class DiscoveryJob(JobRunner):
 
         finally:
             # Always update the run record regardless of success/failure/early return
-            _finish_run(run, counters, final_status, "\n".join(log_lines))
+            _finish_run(run, counters, final_status, "\n".join(log_lines), device_results)
             _update_last_run(target)
 
     def _safe_log(self, msg: str):
@@ -178,7 +202,7 @@ class DiscoveryJob(JobRunner):
                 pass  # already logged via Python logger above
 
 
-def _finish_run(run, counters: dict, status: str, log_text: str):
+def _finish_run(run, counters: dict, status: str, log_text: str, device_results: list = None):
     """Update DiscoveryRun with final status. Never raises."""
     try:
         run.status = status
@@ -188,6 +212,8 @@ def _finish_run(run, counters: dict, status: str, log_text: str):
         run.devices_updated = counters.get("devices_updated", 0)
         run.errors = counters.get("errors", 0)
         run.log = log_text
+        if device_results is not None:
+            run.device_results = device_results
         run.save()
     except Exception as exc:
         logger.error("Failed to save DiscoveryRun %s: %s", run.pk, exc)

@@ -50,10 +50,14 @@
         </div>
     </div>
 
-    {# Counters card #}
+    {# Counters card — numbers are clickable to expand detail panels #}
     <div class="col col-md-6">
         <div class="card">
-            <h5 class="card-header">Results</h5>
+            <h5 class="card-header">Results
+                {% if results_created or results_updated or results_failed %}
+                    <small class="text-muted ms-2" style="font-size:0.75rem;">click a number for details</small>
+                {% endif %}
+            </h5>
             <div class="card-body">
                 <div class="row text-center">
                     <div class="col">
@@ -61,22 +65,109 @@
                         <small class="text-muted">Hosts Scanned</small>
                     </div>
                     <div class="col">
-                        <div class="h2 text-success">{{ object.devices_created }}</div>
+                        {% if results_created %}
+                            <a href="#detail-created" data-bs-toggle="collapse"
+                               class="text-decoration-none">
+                                <div class="h2 text-success">{{ object.devices_created }}</div>
+                            </a>
+                        {% else %}
+                            <div class="h2 text-success">{{ object.devices_created }}</div>
+                        {% endif %}
                         <small class="text-muted">Devices Created</small>
                     </div>
                     <div class="col">
-                        <div class="h2 text-primary">{{ object.devices_updated }}</div>
+                        {% if results_updated %}
+                            <a href="#detail-updated" data-bs-toggle="collapse"
+                               class="text-decoration-none">
+                                <div class="h2 text-primary">{{ object.devices_updated }}</div>
+                            </a>
+                        {% else %}
+                            <div class="h2 text-primary">{{ object.devices_updated }}</div>
+                        {% endif %}
                         <small class="text-muted">Devices Updated</small>
                     </div>
                     <div class="col">
-                        <div class="h2 {% if object.errors > 0 %}text-danger{% else %}text-muted{% endif %}">
-                            {{ object.errors }}
-                        </div>
+                        {% if results_failed %}
+                            <a href="#detail-failed" data-bs-toggle="collapse"
+                               class="text-decoration-none">
+                                <div class="h2 {% if object.errors > 0 %}text-danger{% else %}text-muted{% endif %}">
+                                    {{ object.errors }}</div>
+                            </a>
+                        {% else %}
+                            <div class="h2 {% if object.errors > 0 %}text-danger{% else %}text-muted{% endif %}">
+                                {{ object.errors }}</div>
+                        {% endif %}
                         <small class="text-muted">Errors</small>
                     </div>
                 </div>
             </div>
         </div>
+
+        {# Collapsible detail panels #}
+        {% if results_created %}
+        <div class="collapse mt-2" id="detail-created">
+            <div class="card">
+                <h6 class="card-header text-success">Devices Created ({{ results_created|length }})</h6>
+                <div class="card-body p-0">
+                    <table class="table table-sm table-hover mb-0">
+                        <thead><tr><th>IP</th><th>Hostname</th><th>Driver</th></tr></thead>
+                        <tbody>
+                        {% for r in results_created %}
+                            <tr>
+                                <td><code>{{ r.ip }}</code></td>
+                                <td>{{ r.hostname|default:"—" }}</td>
+                                <td><span class="badge bg-secondary">{{ r.driver|default:"—" }}</span></td>
+                            </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+        {% if results_updated %}
+        <div class="collapse mt-2" id="detail-updated">
+            <div class="card">
+                <h6 class="card-header text-primary">Devices Updated ({{ results_updated|length }})</h6>
+                <div class="card-body p-0">
+                    <table class="table table-sm table-hover mb-0">
+                        <thead><tr><th>IP</th><th>Hostname</th><th>Driver</th></tr></thead>
+                        <tbody>
+                        {% for r in results_updated %}
+                            <tr>
+                                <td><code>{{ r.ip }}</code></td>
+                                <td>{{ r.hostname|default:"—" }}</td>
+                                <td><span class="badge bg-secondary">{{ r.driver|default:"—" }}</span></td>
+                            </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+        {% if results_failed %}
+        <div class="collapse mt-2" id="detail-failed">
+            <div class="card">
+                <h6 class="card-header text-danger">Failed ({{ results_failed|length }})</h6>
+                <div class="card-body p-0">
+                    <table class="table table-sm table-hover mb-0">
+                        <thead><tr><th>IP</th><th>Reason</th></tr></thead>
+                        <tbody>
+                        {% for r in results_failed %}
+                            <tr>
+                                <td><code>{{ r.ip }}</code></td>
+                                <td class="text-muted small">{{ r.error|default:"Unknown error" }}</td>
+                            </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        {% endif %}
     </div>
 </div>
 
@@ -114,12 +205,10 @@
 
 {% if object.status == 'running' %}
 <script>
-    // Auto-scroll log to the bottom so latest output is visible
     (function () {
         var pre = document.getElementById('job-log');
         if (pre) pre.scrollTop = pre.scrollHeight;
     })();
-    // Reload the page every 5 seconds while the job is still running
     setTimeout(function () { location.reload(); }, 5000);
 </script>
 {% endif %}

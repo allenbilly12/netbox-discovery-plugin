@@ -1,0 +1,104 @@
+{% extends 'base/layout.html' %}
+{% load helpers %}
+
+{% block title %}Duplicate Devices{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h1>Duplicate Devices</h1>
+    <span class="badge bg-{% if duplicate_group_count %}warning{% else %}success{% endif %} fs-6">
+        {{ duplicate_group_count }} group{{ duplicate_group_count|pluralize }} found
+    </span>
+</div>
+
+<p class="text-muted">
+    Devices are grouped by their base hostname (the part before the first <code>.</code>).
+    Groups below contain devices that appear to be the same physical device discovered under
+    different domain suffixes (e.g. <code>router1.emea.bcd.local</code> and
+    <code>router1.us.bcd.local</code>).
+    <strong>Merge</strong> copies missing serial / OS version data from the duplicate into the
+    keeper and deletes the duplicate. <strong>Delete</strong> removes a device without merging.
+</p>
+
+{% if not duplicates %}
+<div class="alert alert-success">
+    No duplicate devices found — all base hostnames are unique.
+</div>
+{% endif %}
+
+{% for group in duplicates %}
+<div class="card mb-3">
+    <h5 class="card-header">
+        Base hostname: <code>{{ group.base }}</code>
+        <span class="badge bg-warning ms-2">{{ group.devices|length }} devices</span>
+    </h5>
+    <div class="card-body p-0">
+        <table class="table table-hover mb-0">
+            <thead>
+                <tr>
+                    <th>Device Name</th>
+                    <th>Site</th>
+                    <th>Manufacturer / Model</th>
+                    <th>Serial</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for device in group.devices %}
+                <tr>
+                    <td>
+                        <a href="{{ device.get_absolute_url }}" target="_blank">
+                            {{ device.name }}
+                        </a>
+                    </td>
+                    <td>{{ device.site|default:"—" }}</td>
+                    <td>
+                        {% if device.device_type %}
+                            {{ device.device_type.manufacturer }} {{ device.device_type.model }}
+                        {% else %}—{% endif %}
+                    </td>
+                    <td>{{ device.serial|default:"—" }}</td>
+                    <td>
+                        <span class="badge bg-{% if device.status == 'active' %}success{% else %}secondary{% endif %}">
+                            {{ device.get_status_display }}
+                        </span>
+                    </td>
+                    <td>
+                        {# Merge: this device is the duplicate, the others in the group are candidates to keep #}
+                        <div class="btn-group btn-group-sm">
+                        {% for other in group.devices %}
+                            {% if other.pk != device.pk %}
+                            <form method="post"
+                                  action="{% url 'plugins:netbox_discovery:duplicate_devices_merge' %}"
+                                  class="d-inline"
+                                  onsubmit="return confirm('Merge \'{{ device.name }}\' into \'{{ other.name }}\' and delete \'{{ device.name }}\'?')">
+                                {% csrf_token %}
+                                <input type="hidden" name="keep_id" value="{{ other.pk }}">
+                                <input type="hidden" name="delete_id" value="{{ device.pk }}">
+                                <button type="submit" class="btn btn-sm btn-outline-primary"
+                                        title="Keep '{{ other.name }}', delete this one">
+                                    Merge &rarr; {{ other.name }}
+                                </button>
+                            </form>
+                            {% endif %}
+                        {% endfor %}
+                        <form method="post"
+                              action="{% url 'plugins:netbox_discovery:duplicate_device_delete' pk=device.pk %}"
+                              class="d-inline"
+                              onsubmit="return confirm('Delete device \'{{ device.name }}\'? This cannot be undone.')">
+                            {% csrf_token %}
+                            <button type="submit" class="btn btn-sm btn-outline-danger">
+                                Delete
+                            </button>
+                        </form>
+                        </div>
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endfor %}
+{% endblock %}

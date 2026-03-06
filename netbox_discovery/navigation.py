@@ -25,6 +25,11 @@ menu = PluginMenu(
                     link_text="Run History",
                     permissions=["netbox_discovery.view_discoveryrun"],
                 ),
+                PluginMenuItem(
+                    link="plugins:netbox_discovery:duplicate_devices",
+                    link_text="Duplicate Devices",
+                    permissions=["dcim.view_device"],
+                ),
             ),
         ),
     ),

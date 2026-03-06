@@ -284,6 +284,11 @@ def _ensure_role(name: str):
     return role
 
 
+def _base_hostname(name: str) -> str:
+    """Return the label before the first '.' (the short hostname), lowercased."""
+    return name.split(".")[0].lower() if name else ""
+
+
 def _get_or_create_device(
     hostname: str,
     mgmt_ip: str,
@@ -293,6 +298,7 @@ def _get_or_create_device(
     serial: str,
 ) -> Tuple[Any, bool]:
     from dcim.models import Device
+    from django.db.models import Q
 
     # 1. Try match by exact hostname
     device = Device.objects.filter(name=hostname).first()
@@ -309,7 +315,26 @@ def _get_or_create_device(
         if hasattr(iface, "device") and iface.device:
             return iface.device, False
 
-    # 3. Create new device
+    # 3. Try match by base hostname (same short name, different domain suffix).
+    #    e.g. "router1.emea.bcd.local" matches existing "router1.us.bcd.local"
+    #    or bare "router1" to avoid creating duplicates under different domains.
+    base = _base_hostname(hostname)
+    if base:
+        device = (
+            Device.objects.filter(
+                Q(name__iexact=base) | Q(name__istartswith=base + ".")
+            )
+            .exclude(name=hostname)
+            .first()
+        )
+        if device:
+            logger.info(
+                "Domain-variant match: incoming '%s' matched existing device '%s' (id=%s)",
+                hostname, device.name, device.pk,
+            )
+            return device, False
+
+    # 4. Create new device
     device = Device.objects.create(
         name=hostname,
         site=site,

@@ -62,4 +62,20 @@ urlpatterns = [
         views.DiscoveryRunBulkDeleteView.as_view(),
         name="discoveryrun_bulk_delete",
     ),
+    # Duplicate Devices
+    path(
+        "duplicate-devices/",
+        views.DuplicateDevicesView.as_view(),
+        name="duplicate_devices",
+    ),
+    path(
+        "duplicate-devices/merge/",
+        views.MergeDevicesView.as_view(),
+        name="duplicate_devices_merge",
+    ),
+    path(
+        "duplicate-devices/<int:pk>/delete/",
+        views.DeleteDuplicateDeviceView.as_view(),
+        name="duplicate_device_delete",
+    ),
 ]

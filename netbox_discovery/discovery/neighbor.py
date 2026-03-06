@@ -32,6 +32,7 @@ def crawl(
     max_depth: int = 3,
     discovery_protocol: str = "both",
     on_device_data: Optional[Callable[[str, Dict[str, Any], str], None]] = None,
+    on_device_failed: Optional[Callable[[str, str], None]] = None,
     log_fn: Optional[Callable[[str], None]] = None,
     stop_flag: Optional[Callable[[], bool]] = None,
     max_workers: int = 5,
@@ -50,6 +51,8 @@ def crawl(
         on_device_data: Callback invoked with (ip, device_data_dict, driver_name)
                         for each successfully collected device. Typically writes
                         to NetBox.
+        on_device_failed: Optional callback invoked with (ip, error_message) for
+                          each device that failed to connect or collect data.
         log_fn: Optional log/progress callback (must be thread-safe).
         stop_flag: Optional callable that returns True to abort early.
         max_workers: Number of devices to process in parallel.
@@ -138,6 +141,8 @@ def crawl(
                         log_fn(f"  [FAILED] {ip} — could not connect with any driver. Skipping.")
                         with lock:
                             summary["failed"] += 1
+                        if on_device_failed:
+                            on_device_failed(ip, "Could not connect with any driver")
                         continue
 
                     try:
@@ -161,6 +166,8 @@ def crawl(
                             logger.error("collect_device_data timed out for %s", ip)
                             with lock:
                                 summary["failed"] += 1
+                            if on_device_failed:
+                                on_device_failed(ip, f"Data collection timed out after {collect_timeout}s")
                             continue
                         finally:
                             executor.shutdown(wait=False, cancel_futures=True)
@@ -211,6 +218,8 @@ def crawl(
                         logger.exception("Collection error for %s", ip)
                         with lock:
                             summary["failed"] += 1
+                        if on_device_failed:
+                            on_device_failed(ip, str(exc))
                     finally:
                         try:
                             device.close()

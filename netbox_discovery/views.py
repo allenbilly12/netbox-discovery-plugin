@@ -1,8 +1,9 @@
 import logging
+from collections import defaultdict
 
 from django.contrib import messages
 from django.http import HttpResponseRedirect
-from django.shortcuts import get_object_or_404, redirect
+from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.views import View
@@ -18,6 +19,104 @@ from .models import DiscoveryRun, DiscoveryTarget
 from .tables import DiscoveryRunTable, DiscoveryTargetTable
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
+
+
+# ---------------------------------------------------------------------------
+# Duplicate Devices views
+# ---------------------------------------------------------------------------
+
+
+def _base_name(device_name: str) -> str:
+    """Return the short hostname (before first '.'), lowercased."""
+    return device_name.split(".")[0].lower() if device_name else ""
+
+
+class DuplicateDevicesView(View):
+    """
+    Lists NetBox devices that share the same base hostname but have different
+    full names (e.g. router1.emea.bcd.local vs router1.us.bcd.local).
+    """
+
+    template_name = "netbox_discovery/duplicate_devices.html"
+
+    def get(self, request):
+        from dcim.models import Device
+
+        groups: dict = defaultdict(list)
+        for device in Device.objects.select_related(
+            "site", "device_type__manufacturer", "role"
+        ).order_by("name"):
+            key = _base_name(device.name)
+            if key:
+                groups[key].append(device)
+
+        duplicates = [
+            {"base": base, "devices": devs}
+            for base, devs in sorted(groups.items())
+            if len(devs) > 1
+        ]
+
+        return render(request, self.template_name, {
+            "duplicates": duplicates,
+            "duplicate_group_count": len(duplicates),
+        })
+
+
+class MergeDevicesView(View):
+    """
+    POST: keep one device, copy missing data from the duplicate, then delete it.
+    """
+
+    def post(self, request):
+        from dcim.models import Device
+
+        keep_id = request.POST.get("keep_id")
+        delete_id = request.POST.get("delete_id")
+
+        if not keep_id or not delete_id or keep_id == delete_id:
+            messages.error(request, "Invalid merge request — select two different devices.")
+            return redirect("plugins:netbox_discovery:duplicate_devices")
+
+        keeper = get_object_or_404(Device, pk=keep_id)
+        duplicate = get_object_or_404(Device, pk=delete_id)
+
+        changed = False
+        # Copy serial if keeper has none
+        if not keeper.serial and duplicate.serial:
+            keeper.serial = duplicate.serial
+            changed = True
+
+        # Copy os_version custom field if keeper lacks it
+        dup_cf = duplicate.custom_field_data or {}
+        keep_cf = dict(keeper.custom_field_data or {})
+        if not keep_cf.get("os_version") and dup_cf.get("os_version"):
+            keep_cf["os_version"] = dup_cf["os_version"]
+            keeper.custom_field_data = keep_cf
+            changed = True
+
+        if changed:
+            keeper.save()
+
+        dup_name = duplicate.name
+        duplicate.delete()
+        messages.success(
+            request,
+            f"Merged '{dup_name}' into '{keeper.name}' and deleted the duplicate.",
+        )
+        return redirect("plugins:netbox_discovery:duplicate_devices")
+
+
+class DeleteDuplicateDeviceView(View):
+    """POST: delete a single device identified as a duplicate."""
+
+    def post(self, request, pk):
+        from dcim.models import Device
+
+        device = get_object_or_404(Device, pk=pk)
+        name = device.name
+        device.delete()
+        messages.success(request, f"Device '{name}' deleted.")
+        return redirect("plugins:netbox_discovery:duplicate_devices")
 
 
 # ---------------------------------------------------------------------------
@@ -149,4 +248,10 @@ class DiscoveryRunView(generic.ObjectView):
 
     def get_extra_context(self, request, instance):
         log_lines = instance.log.splitlines() if instance.log else []
-        return {"log_lines": log_lines}
+        results = instance.device_results or []
+        return {
+            "log_lines": log_lines,
+            "results_created": [r for r in results if r.get("status") == "created"],
+            "results_updated": [r for r in results if r.get("status") == "updated"],
+            "results_failed": [r for r in results if r.get("status") == "failed"],
+        }
