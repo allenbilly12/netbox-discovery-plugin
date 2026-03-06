@@ -86,20 +86,41 @@
         <div class="card">
             <h5 class="card-header">
                 Job Log
+                {% if object.status == 'running' %}
+                    <span class="badge bg-primary ms-1">Live</span>
+                {% endif %}
                 {% if log_lines %}
                     <span class="badge bg-secondary">{{ log_lines|length }} lines</span>
                 {% endif %}
             </h5>
             <div class="card-body p-0">
                 {% if log_lines %}
-                    <pre class="mb-0 p-3"
+                    <pre id="job-log" class="mb-0 p-3"
                          style="max-height: 600px; overflow-y: auto; background: #1e1e2e; color: #cdd6f4; font-size: 0.8rem;">{% for line in log_lines %}{{ line }}
 {% endfor %}</pre>
                 {% else %}
-                    <p class="text-muted p-3">No log output available.</p>
+                    <p class="text-muted p-3" id="job-log-empty">
+                        {% if object.status == 'running' %}
+                            Job is running — log will appear here shortly&hellip;
+                        {% else %}
+                            No log output available.
+                        {% endif %}
+                    </p>
                 {% endif %}
             </div>
         </div>
     </div>
 </div>
+
+{% if object.status == 'running' %}
+<script>
+    // Auto-scroll log to the bottom so latest output is visible
+    (function () {
+        var pre = document.getElementById('job-log');
+        if (pre) pre.scrollTop = pre.scrollHeight;
+    })();
+    // Reload the page every 5 seconds while the job is still running
+    setTimeout(function () { location.reload(); }, 5000);
+</script>
+{% endif %}
 {% endblock %}

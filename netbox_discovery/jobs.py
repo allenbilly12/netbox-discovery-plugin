@@ -62,11 +62,21 @@ class DiscoveryJob(JobRunner):
         }
         log_lines = []
         final_status = "failed"
+        _flush_counter = [0]
 
         def log_fn(msg):
             log_lines.append(msg)
             logger.info("[Discovery:%s] %s", target.name, msg)
             self._safe_log(msg)
+            # Flush log to DB every 5 lines so the UI shows live progress
+            _flush_counter[0] += 1
+            if _flush_counter[0] % 5 == 0:
+                try:
+                    run.__class__.objects.filter(pk=run.pk).update(
+                        log="\n".join(log_lines)
+                    )
+                except Exception:
+                    pass
 
         try:
             log_fn(f"=== Discovery started: {target.name} ===")
