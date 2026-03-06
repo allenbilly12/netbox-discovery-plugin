@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netbox-discovery"
-version = "1.0.0"
+version = "1.1.0"
 description = "NetBox plugin for automatic network device discovery via CDP/LLDP and NAPALM"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-    {name = "NetBox Discovery Contributors", email = "noreply@example.com"}
+    {name = "Billy Allen", email = "noidea@example.com"}
 ]
 keywords = ["netbox", "network", "discovery", "cdp", "lldp", "napalm", "plugin"]
 classifiers = [
@@ -26,8 +26,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/example/netbox-discovery"
-Issues = "https://github.com/example/netbox-discovery/issues"
+Homepage = "https://github.com/allenbilly12/netbox-discovery"
+Issues = "https://github.com/allenbilly12/netbox-discovery/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
