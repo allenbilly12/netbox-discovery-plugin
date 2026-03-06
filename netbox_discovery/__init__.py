@@ -24,14 +24,18 @@ class DiscoveryConfig(PluginConfig):
 
     def ready(self):
         super().ready()
-        # Ensure the os_version custom field exists on Device so that
-        # netbox_sync.py can write to custom_field_data["os_version"].
-        # Wrapped in a broad except so a missing table during initial
-        # migrations never prevents the plugin from loading.
-        try:
-            _ensure_os_version_custom_field()
-        except Exception:
-            pass
+        # Defer the os_version custom field creation to post_migrate so we
+        # don't touch the DB during app initialisation (avoids RuntimeWarning).
+        from django.db.models.signals import post_migrate
+        post_migrate.connect(_on_post_migrate, sender=self)
+
+
+def _on_post_migrate(sender, **kwargs):
+    """Called after migrations complete — safe to query the DB here."""
+    try:
+        _ensure_os_version_custom_field()
+    except Exception:
+        pass
 
 
 def _ensure_os_version_custom_field():
