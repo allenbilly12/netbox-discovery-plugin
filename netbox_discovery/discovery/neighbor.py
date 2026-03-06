@@ -59,6 +59,11 @@ def crawl(
     collect_timeout = max(timeout * 6, 60)
 
     visited: Set[str] = set()
+    # queued tracks every IP ever added to the queue so we never enqueue the
+    # same IP twice — visited alone isn't sufficient because it's only updated
+    # when an IP is *dequeued*, allowing the same IP to accumulate in the queue
+    # as a neighbor of multiple devices before it's first processed.
+    queued: Set[str] = set(seed_ips)
     # Queue entries: (ip, depth)
     queue: deque = deque()
     for ip in seed_ips:
@@ -145,10 +150,13 @@ def crawl(
                 if depth < max_depth:
                     new_ips = _extract_neighbor_ips(data.get("neighbors", []))
                     for neighbor_ip in new_ips:
-                        if neighbor_ip and neighbor_ip not in visited:
+                        if neighbor_ip and neighbor_ip not in queued:
                             log_fn(f"  Queuing neighbor: {neighbor_ip} (depth={depth + 1})")
                             queue.append((neighbor_ip, depth + 1))
+                            queued.add(neighbor_ip)
                             summary["neighbors_queued"] += 1
+                        elif neighbor_ip in queued and neighbor_ip not in visited:
+                            log_fn(f"  Neighbor {neighbor_ip} already queued — skipping duplicate")
 
             except Exception as exc:
                 log_fn(f"  [ERROR] Data collection failed for {ip}: {exc} — skipping device")

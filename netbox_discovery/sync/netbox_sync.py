@@ -173,8 +173,17 @@ def sync_device(
 
         # --- Set primary IP ---
         if primary_ip and device.primary_ip4 != primary_ip:
-            device.primary_ip4 = primary_ip
-            device.save()
+            # Guard against the unique constraint on primary_ip4_id:
+            # if another device already owns this IP as primary, skip rather than crash.
+            conflict = Device.objects.filter(primary_ip4=primary_ip).exclude(pk=device.pk).first()
+            if conflict:
+                log_fn(
+                    f"  [WARN] Cannot set primary IP {primary_ip} on '{hostname}': "
+                    f"already primary on '{conflict.name}' — skipping"
+                )
+            else:
+                device.primary_ip4 = primary_ip
+                device.save()
 
         # --- VLANs ---
         _sync_vlans(vlans_raw, site, log_fn)
