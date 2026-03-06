@@ -111,26 +111,27 @@ def sync_device(
         site = _ensure_site(holding_site_name)
 
         # --- Manufacturer ---
-        mfr, _ = Manufacturer.objects.get_or_create(
-            name__iexact=vendor,
-            defaults={"name": vendor, "slug": make_slug(vendor)},
-        )
-        # Handle case where iexact match returns existing but slug differs
-        if _:
-            pass  # freshly created
-        else:
-            # ensure slug exists
-            if not mfr.slug:
-                mfr.slug = make_slug(vendor)
-                mfr.save()
+        # Use filter().first() to tolerate duplicate rows (raises MultipleObjectsReturned
+        # with get_or_create when the DB already has two matching entries).
+        mfr = Manufacturer.objects.filter(name__iexact=vendor).first()
+        if mfr is None:
+            mfr, _ = Manufacturer.objects.get_or_create(
+                name=vendor,
+                defaults={"slug": make_slug(vendor)},
+            )
+        if not mfr.slug:
+            mfr.slug = make_slug(vendor)
+            mfr.save()
 
         # --- DeviceType ---
-        dtype, created_dtype = DeviceType.objects.get_or_create(
-            manufacturer=mfr,
-            model__iexact=model,
-            defaults={"model": model, "slug": make_slug(f"{vendor}-{model}")},
-        )
-        if not created_dtype and not dtype.slug:
+        dtype = DeviceType.objects.filter(manufacturer=mfr, model__iexact=model).first()
+        if dtype is None:
+            dtype, _ = DeviceType.objects.get_or_create(
+                manufacturer=mfr,
+                model=model,
+                defaults={"slug": make_slug(f"{vendor}-{model}")},
+            )
+        if not dtype.slug:
             dtype.slug = make_slug(f"{vendor}-{model}")
             dtype.save()
 
@@ -190,24 +191,28 @@ def sync_device(
 def _ensure_site(name: str):
     from dcim.models import Site
 
-    site, created = Site.objects.get_or_create(
-        name__iexact=name,
-        defaults={"name": name, "slug": make_slug(name), "status": "active"},
-    )
-    if created:
-        logger.info("Created holding site: %s", name)
+    site = Site.objects.filter(name__iexact=name).first()
+    if site is None:
+        site, created = Site.objects.get_or_create(
+            name=name,
+            defaults={"slug": make_slug(name), "status": "active"},
+        )
+        if created:
+            logger.info("Created holding site: %s", name)
     return site
 
 
 def _ensure_role(name: str):
     from dcim.models import DeviceRole
 
-    role, created = DeviceRole.objects.get_or_create(
-        name__iexact=name,
-        defaults={"name": name, "slug": make_slug(name), "color": "2196f3"},
-    )
-    if created:
-        logger.info("Created device role: %s", name)
+    role = DeviceRole.objects.filter(name__iexact=name).first()
+    if role is None:
+        role, created = DeviceRole.objects.get_or_create(
+            name=name,
+            defaults={"slug": make_slug(name), "color": "2196f3"},
+        )
+        if created:
+            logger.info("Created device role: %s", name)
     return role
 
 
