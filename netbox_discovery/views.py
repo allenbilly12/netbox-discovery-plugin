@@ -69,6 +69,7 @@ class MergeDevicesView(View):
 
     def post(self, request):
         from dcim.models import Device
+        from django.conf import settings
 
         keep_id = request.POST.get("keep_id")
         delete_id = request.POST.get("delete_id")
@@ -80,13 +81,26 @@ class MergeDevicesView(View):
         keeper = get_object_or_404(Device, pk=keep_id)
         duplicate = get_object_or_404(Device, pk=delete_id)
 
+        holding_site_name = (
+            settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get("holding_site", "Holding")
+        )
+
         changed = False
-        # Copy serial if keeper has none
+
+        # Site: prefer whichever device has a real (non-holding) site.
+        # A manually-assigned site is always considered authoritative.
+        keeper_on_holding = not keeper.site or keeper.site.name == holding_site_name
+        dup_has_real_site = duplicate.site and duplicate.site.name != holding_site_name
+        if keeper_on_holding and dup_has_real_site:
+            keeper.site = duplicate.site
+            changed = True
+
+        # Serial: copy if keeper has none
         if not keeper.serial and duplicate.serial:
             keeper.serial = duplicate.serial
             changed = True
 
-        # Copy os_version custom field if keeper lacks it
+        # os_version custom field
         dup_cf = duplicate.custom_field_data or {}
         keep_cf = dict(keeper.custom_field_data or {})
         if not keep_cf.get("os_version") and dup_cf.get("os_version"):
@@ -94,8 +108,28 @@ class MergeDevicesView(View):
             keeper.custom_field_data = keep_cf
             changed = True
 
+        # Virtual Chassis: if duplicate is in a VC and keeper is not, transfer membership.
+        dup_vc = duplicate.virtual_chassis
+        if dup_vc and not keeper.virtual_chassis:
+            keeper.virtual_chassis = dup_vc
+            keeper.vc_position = duplicate.vc_position
+            keeper.vc_priority = duplicate.vc_priority
+            changed = True
+
         if changed:
             keeper.save()
+
+        # If duplicate was the VC master, promote keeper as the new master
+        if dup_vc and dup_vc.master_id == duplicate.pk:
+            dup_vc.master = keeper
+            dup_vc.save()
+
+        # Detach duplicate from VC before deletion to avoid FK constraint issues
+        if duplicate.virtual_chassis:
+            duplicate.virtual_chassis = None
+            duplicate.vc_position = None
+            duplicate.vc_priority = None
+            duplicate.save()
 
         dup_name = duplicate.name
         duplicate.delete()

@@ -204,6 +204,14 @@ def sync_device(
                     changed = True
             except Exception as exc:
                 log_fn(f"  [WARN] Could not set os_version custom field: {exc}")
+        # --- Hostname-to-site auto-assignment (only if still on holding site) ---
+        if device.site_id == site.pk:
+            matched_site = _match_site_by_hostname(hostname, exclude_site_name=holding_site_name)
+            if matched_site:
+                device.site = matched_site
+                changed = True
+                log_fn(f"  Auto-assigned site '{matched_site.name}' from hostname prefix.")
+
         if changed:
             device.save()
 
@@ -300,6 +308,41 @@ def _ensure_role(name: str):
 def _base_hostname(name: str) -> str:
     """Return the label before the first '.' (the short hostname), lowercased."""
     return name.split(".")[0].lower() if name else ""
+
+
+def _match_site_by_hostname(hostname: str, exclude_site_name: str = "Holding"):
+    """
+    Find the NetBox site whose name best matches as a prefix of the hostname.
+
+    Strips domain suffix and normalises separators before comparing so that
+    e.g. hostname 'GBLON10SWI01' matches site 'GBLON10'.  The longest matching
+    prefix wins (most specific site).  Requires at least 4 characters to avoid
+    spurious single-letter matches.
+
+    Returns the matching Site object, or None.
+    """
+    from dcim.models import Site
+
+    short = hostname.split(".")[0].upper()
+    if len(short) < 4:
+        return None
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[-_\s]", "", s).upper()
+
+    norm_short = _norm(short)
+    best_site = None
+    best_len = 0
+
+    for site in Site.objects.exclude(name__iexact=exclude_site_name):
+        norm_name = _norm(site.name)
+        if len(norm_name) < 4:
+            continue
+        if norm_short.startswith(norm_name) and len(norm_name) > best_len:
+            best_len = len(norm_name)
+            best_site = site
+
+    return best_site
 
 
 def _get_or_create_device(
@@ -563,7 +606,7 @@ def _sync_virtual_chassis(
         if mem_dev is None:
             mem_dev = Device.objects.create(
                 name=member_name,
-                site=site,
+                site=master_device.site,
                 device_type=member_dtype,
                 role=role,
                 serial=member_serial,
@@ -589,6 +632,9 @@ def _sync_virtual_chassis(
                 changed = True
             if mem_dev.device_type_id != member_dtype.pk:
                 mem_dev.device_type = member_dtype
+                changed = True
+            if mem_dev.site_id != master_device.site_id:
+                mem_dev.site = master_device.site
                 changed = True
             if changed:
                 mem_dev.save()
