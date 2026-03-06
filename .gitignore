@@ -3,35 +3,110 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.pyi
 *.egg
 *.egg-info/
 dist/
 build/
 .eggs/
 *.egg-link
+*.so
+*.dylib
+MANIFEST
 
 # Virtual environments
 .venv/
 venv/
 env/
+.env
+.env.*
+*.env
 
 # Django
 *.sqlite3
 local_settings.py
+db.sqlite3
+staticfiles/
+media/
 
-# IDE
+# Testing
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+pytest.ini
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Type checking
+.mypy_cache/
+.pytype/
+.pyre/
+pyrightconfig.json
+
+# IDE / editors
 .vscode/
 .idea/
 *.swp
 *.swo
+*.swn
+*~
+.project
+.pydevproject
+*.sublime-project
+*.sublime-workspace
 
 # OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+desktop.ini
 
-# Distribution
+# Distribution / packaging
 *.whl
 *.tar.gz
+*.zip
+MANIFEST.in
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Logs
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Node (if any frontend tooling added later)
+node_modules/
+npm-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Secrets / credentials
+secrets.py
+.secrets/
+*.pem
+*.key
+*.crt
+
+# Temporary / scratch
+tmp/
+temp/
+scratch/
+*.bak
+*.orig
+*.rej
 
 # Claude Code
 .claude/
