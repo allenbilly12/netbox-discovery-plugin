@@ -74,20 +74,15 @@ def _try_driver(
         if enable_secret:
             optional_args["secret"] = enable_secret
 
-        # NX-OS (especially Nexus 7000) can be slow to respond after each command
-        # due to supervisor latency.  Without extra delay Netmiko's prompt detection
-        # races ahead and logs "Pattern not detected: 'HOSTNAME\#' in output" for
-        # every CLI call after the first.  Doubling the global delay factor and
-        # disabling fast_cli gives the device enough time to send its prompt.
-        if driver_name == "nxos_ssh":
-            optional_args["global_delay_factor"] = 2
-            optional_args["fast_cli"] = False
-
         device = driver_cls(
             hostname=ip,
             username=username,
             password=password,
-            timeout=timeout,
+            # NX-OS devices (especially Nexus 7000) run slow commands like
+            # 'show interfaces' that can take 10+ seconds on large chassis.
+            # Pass a higher timeout for nxos_ssh so Netmiko waits long enough
+            # for each command's prompt rather than declaring it missing.
+            timeout=max(timeout * 3, 30) if driver_name == "nxos_ssh" else timeout,
             optional_args=optional_args,
         )
         device.open()
@@ -135,12 +130,11 @@ def _try_driver_timed(
     with a deadline prevents a single slow driver from stalling the entire
     discovery job.
     """
-    # nxos_ssh uses global_delay_factor=2 which doubles all internal Netmiko
-    # read delays, making get_facts() take roughly twice as long on slow
-    # devices like Nexus 7000 (~10-12s vs ~5-6s).  Give it a proportionally
-    # larger deadline so the thread is not killed before get_facts() returns.
+    # nxos_ssh uses a 3x higher NAPALM timeout to allow slow NX-OS commands
+    # (e.g. 'show interfaces' on a Nexus 7000 with 100+ interfaces) to complete.
+    # The wall-clock deadline must be at least as large as that extended timeout.
     if driver_name == "nxos_ssh":
-        deadline = timeout * 2 + 4
+        deadline = max(timeout * 3, 30) + 4
     else:
         deadline = timeout + 2
 
