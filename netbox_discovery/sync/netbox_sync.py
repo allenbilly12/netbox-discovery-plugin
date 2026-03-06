@@ -137,7 +137,13 @@ def sync_device(
     vlans_raw = data.get("vlans", {})
     stack_members = data.get("stack_members", [])
 
-    hostname = (facts.get("hostname") or mgmt_ip).strip()
+    raw_hostname = (facts.get("hostname") or "").strip()
+    if _is_valid_hostname(raw_hostname):
+        hostname = raw_hostname
+    else:
+        if raw_hostname:
+            log_fn(f"  [WARN] Ignoring invalid hostname '{raw_hostname[:60]}' — using IP as identifier")
+        hostname = mgmt_ip
     vendor = (facts.get("vendor") or "Unknown").strip()
     model = (facts.get("model") or "Unknown").strip()
     serial = (facts.get("serial_number") or "").strip()
@@ -234,21 +240,40 @@ def sync_device(
                     if assigned_iface and hasattr(assigned_iface, "device")
                     else str(assigned_iface) if assigned_iface else "unassigned"
                 )
-                warn_msg = (
-                    f"  [WARN] Primary IP conflict — cannot assign {primary_ip} to '{hostname}' "
-                    f"(mgmt={mgmt_ip}): already primary on '{conflict.name}' "
-                    f"(id={conflict.pk}, site={conflict.site}). "
-                    f"IP currently assigned to interface: {assigned_desc}."
-                )
-                log_fn(warn_msg)
-                _get_conflict_logger().warning(
-                    "PRIMARY IP CONFLICT | wanted_device=%s (id=%s, mgmt=%s) | "
-                    "blocking_device=%s (id=%s, site=%s) | "
-                    "ip=%s (id=%s) | ip_assigned_to=%s",
-                    hostname, device.pk, mgmt_ip,
-                    conflict.name, conflict.pk, conflict.site,
-                    primary_ip, primary_ip.pk, assigned_desc,
-                )
+
+                # Auto-resolve: if the blocking device is a domain-variant of the
+                # current device (same base hostname, different suffix), the conflict
+                # is a stale duplicate.  Strip the primary-IP claim from the stale
+                # device so this device can take it.
+                if _base_hostname(conflict.name) == _base_hostname(hostname):
+                    try:
+                        conflict.primary_ip4 = None
+                        conflict.save()
+                        device.primary_ip4 = primary_ip
+                        device.save()
+                        log_fn(
+                            f"  Auto-resolved primary IP conflict: cleared primary from "
+                            f"domain-variant '{conflict.name}' (id={conflict.pk}), "
+                            f"assigned {primary_ip} to '{hostname}'."
+                        )
+                    except Exception as exc:
+                        log_fn(f"  [WARN] Could not auto-resolve IP conflict: {exc}")
+                else:
+                    warn_msg = (
+                        f"  [WARN] Primary IP conflict — cannot assign {primary_ip} to '{hostname}' "
+                        f"(mgmt={mgmt_ip}): already primary on '{conflict.name}' "
+                        f"(id={conflict.pk}, site={conflict.site}). "
+                        f"IP currently assigned to interface: {assigned_desc}."
+                    )
+                    log_fn(warn_msg)
+                    _get_conflict_logger().warning(
+                        "PRIMARY IP CONFLICT | wanted_device=%s (id=%s, mgmt=%s) | "
+                        "blocking_device=%s (id=%s, site=%s) | "
+                        "ip=%s (id=%s) | ip_assigned_to=%s",
+                        hostname, device.pk, mgmt_ip,
+                        conflict.name, conflict.pk, conflict.site,
+                        primary_ip, primary_ip.pk, assigned_desc,
+                    )
             else:
                 device.primary_ip4 = primary_ip
                 device.save()
@@ -308,6 +333,41 @@ def _ensure_role(name: str):
 def _base_hostname(name: str) -> str:
     """Return the label before the first '.' (the short hostname), lowercased."""
     return name.split(".")[0].lower() if name else ""
+
+
+# Hostnames that are known-bad: CLI error artifacts, OS identifiers, generic labels.
+_INVALID_HOSTNAME_EXACT = {
+    "kernel", "localhost", "router", "switch", "firewall",
+    "linux", "ubuntu", "debian", "centos", "redhat",
+}
+# Substrings/prefixes that indicate a Cisco CLI error was captured as a hostname.
+_INVALID_HOSTNAME_FRAGMENTS = [
+    "% invalid",
+    "% incomplete",
+    "% ambiguous",
+    "invalid input",
+    "incomplete command",
+]
+
+
+def _is_valid_hostname(hostname: str) -> bool:
+    """
+    Return False if *hostname* looks like a CLI error artifact or a non-network
+    device identifier rather than a real network device hostname.
+    """
+    if not hostname:
+        return False
+    h = hostname.strip()
+    # Reject the raw management IP as a hostname (fallback — we handle it upstream)
+    if not h or h.startswith("^"):
+        return False
+    h_lower = h.lower()
+    if h_lower in _INVALID_HOSTNAME_EXACT:
+        return False
+    for frag in _INVALID_HOSTNAME_FRAGMENTS:
+        if frag in h_lower:
+            return False
+    return True
 
 
 def _match_site_by_hostname(hostname: str, exclude_site_name: str = "Holding"):
