@@ -135,7 +135,14 @@ def _try_driver_timed(
     with a deadline prevents a single slow driver from stalling the entire
     discovery job.
     """
-    deadline = timeout + 2  # a little headroom over the NAPALM timeout
+    # nxos_ssh uses global_delay_factor=2 which doubles all internal Netmiko
+    # read delays, making get_facts() take roughly twice as long on slow
+    # devices like Nexus 7000 (~10-12s vs ~5-6s).  Give it a proportionally
+    # larger deadline so the thread is not killed before get_facts() returns.
+    if driver_name == "nxos_ssh":
+        deadline = timeout * 2 + 4
+    else:
+        deadline = timeout + 2
 
     # Do NOT use 'with ThreadPoolExecutor(...) as executor:' here.
     # The context manager calls shutdown(wait=True) on __exit__, which blocks
