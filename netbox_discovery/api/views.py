@@ -34,11 +34,9 @@ class DiscoveryTargetViewSet(NetBoxModelViewSet):
         try:
             from ..jobs import DiscoveryJob
 
-            from ..jobs import JOB_TIMEOUT
             DiscoveryJob.enqueue(
                 data={"target_id": target.pk},
                 name=f"Discovery: {target.name}",
-                job_timeout=JOB_TIMEOUT,
             )
             return Response({"detail": f"Discovery job enqueued for '{target.name}'."})
         except Exception as exc:

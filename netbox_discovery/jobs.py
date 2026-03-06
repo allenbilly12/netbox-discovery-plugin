@@ -26,9 +26,6 @@ class DiscoveryJob(JobRunner):
 
     class Meta:
         name = "Network Discovery"
-        # Tell RQ/NetBox to allow up to 1 hour before killing the worker process.
-        # The default (300 s) is far too short for multi-device crawls.
-        job_timeout = JOB_TIMEOUT
 
     def run(self, data, commit=True):
         from .models import DiscoveryRun, DiscoveryTarget
@@ -261,7 +258,7 @@ try:
                     target.name,
                     target.scan_interval,
                 )
-                DiscoveryJob.enqueue(data={"target_id": target.pk}, job_timeout=JOB_TIMEOUT)
+                DiscoveryJob.enqueue(data={"target_id": target.pk})
 
 except ImportError:
     logger.warning(
