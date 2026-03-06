@@ -93,7 +93,11 @@ class DiscoveryJob(JobRunner):
             log_fn(f"Protocol: {target.discovery_protocol} | Max depth: {target.max_depth}")
 
             # Step 1: host scan
-            live_ips = scan_targets(target.get_target_list(), log_fn=log_fn)
+            live_ips = scan_targets(
+                target.get_target_list(),
+                exclusion_strings=target.get_exclusion_list(),
+                log_fn=log_fn,
+            )
             counters["hosts_scanned"] = len(live_ips)
 
             if not live_ips:

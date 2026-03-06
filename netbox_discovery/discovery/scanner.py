@@ -108,7 +108,36 @@ def _tcp_probe(ips: List[str], log_fn: Callable) -> Set[str]:
     return live
 
 
-def scan_targets(target_strings: List[str], log_fn: Callable = None) -> Set[str]:
+def _build_exclusion_set(exclusion_strings: List[str]) -> List[netaddr.IPNetwork]:
+    """Parse exclusion strings into a list of IPNetwork objects for fast membership testing."""
+    networks = []
+    for entry in exclusion_strings:
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            networks.append(netaddr.IPNetwork(entry))
+        except netaddr.AddrFormatError:
+            logger.warning("Invalid exclusion address: %s", entry)
+    return networks
+
+
+def _is_excluded(ip: str, exclusion_networks: List[netaddr.IPNetwork]) -> bool:
+    """Return True if ip falls within any of the exclusion networks."""
+    if not exclusion_networks:
+        return False
+    try:
+        addr = netaddr.IPAddress(ip)
+        return any(addr in net for net in exclusion_networks)
+    except netaddr.AddrFormatError:
+        return False
+
+
+def scan_targets(
+    target_strings: List[str],
+    exclusion_strings: List[str] = None,
+    log_fn: Callable = None,
+) -> Set[str]:
     """
     Expand target IPs/CIDRs and scan to find live hosts.
 
@@ -119,6 +148,7 @@ def scan_targets(target_strings: List[str], log_fn: Callable = None) -> Set[str]
 
     Args:
         target_strings: List of IP strings or CIDR notations.
+        exclusion_strings: Optional list of IPs/CIDRs to exclude from results.
         log_fn: Optional callable for progress messages.
 
     Returns:
@@ -126,6 +156,10 @@ def scan_targets(target_strings: List[str], log_fn: Callable = None) -> Set[str]
     """
     if log_fn is None:
         log_fn = lambda msg: logger.info(msg)
+
+    exclusion_networks = _build_exclusion_set(exclusion_strings or [])
+    if exclusion_networks:
+        log_fn(f"Exclusions active: {[str(n) for n in exclusion_networks]}")
 
     # Separate explicit single IPs from CIDR ranges
     single_ips: Set[str] = set()
@@ -144,6 +178,12 @@ def scan_targets(target_strings: List[str], log_fn: Callable = None) -> Set[str]
         except netaddr.AddrFormatError:
             logger.warning("Invalid target address: %s", target)
 
+    # Apply exclusions to explicit single IPs
+    excluded_singles = {ip for ip in single_ips if _is_excluded(ip, exclusion_networks)}
+    if excluded_singles:
+        log_fn(f"Excluding {len(excluded_singles)} individual IP(s): {sorted(excluded_singles)}")
+        single_ips -= excluded_singles
+
     if single_ips:
         log_fn(
             f"{len(single_ips)} individual IP(s) will be tried directly "
@@ -154,6 +194,13 @@ def scan_targets(target_strings: List[str], log_fn: Callable = None) -> Set[str]
 
     if range_targets:
         range_ips = _expand_targets(range_targets)
+        # Apply exclusions before scanning to avoid probing excluded hosts at all
+        if exclusion_networks:
+            before = len(range_ips)
+            range_ips = [ip for ip in range_ips if not _is_excluded(ip, exclusion_networks)]
+            excluded_count = before - len(range_ips)
+            if excluded_count:
+                log_fn(f"Excluded {excluded_count} IP(s) from CIDR ranges before scanning.")
         log_fn(f"Scanning {len(range_ips)} IPs from {len(range_targets)} CIDR range(s)...")
         if range_ips:
             log_fn(f"Starting host discovery (TCP connect on ports {PROBE_PORTS})...")

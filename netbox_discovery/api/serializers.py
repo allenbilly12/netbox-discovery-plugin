@@ -22,6 +22,7 @@ class DiscoveryTargetSerializer(NetBoxModelSerializer):
             "name",
             "description",
             "targets",
+            "exclusions",
             "credential_username",
             "credential_password",
             "enable_secret",

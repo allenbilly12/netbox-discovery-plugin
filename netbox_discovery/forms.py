@@ -28,7 +28,7 @@ class DiscoveryTargetForm(NetBoxModelForm):
     )
 
     fieldsets = (
-        FieldSet("name", "description", "targets", name="Basic"),
+        FieldSet("name", "description", "targets", "exclusions", name="Basic"),
         FieldSet(
             "credential_username",
             "credential_password",
@@ -53,6 +53,7 @@ class DiscoveryTargetForm(NetBoxModelForm):
             "name",
             "description",
             "targets",
+            "exclusions",
             "credential_username",
             "credential_password",
             "enable_secret",

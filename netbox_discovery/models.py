@@ -67,6 +67,13 @@ class DiscoveryTarget(NetBoxModel):
             "Example: 10.0.0.1 or 192.168.1.0/24"
         )
     )
+    exclusions = models.TextField(
+        blank=True,
+        help_text=(
+            "IPs or CIDR ranges to exclude from scanning, one per line. "
+            "Example: 10.0.0.5 or 192.168.1.0/28"
+        ),
+    )
 
     # Credentials (optional — falls back to PLUGINS_CONFIG defaults)
     credential_username = models.CharField(
@@ -189,6 +196,10 @@ class DiscoveryTarget(NetBoxModel):
     def get_target_list(self):
         """Return list of non-empty target strings."""
         return [t.strip() for t in self.targets.splitlines() if t.strip()]
+
+    def get_exclusion_list(self):
+        """Return list of non-empty exclusion strings."""
+        return [e.strip() for e in self.exclusions.splitlines() if e.strip()]
 
 
 class DiscoveryRun(NetBoxModel):
