@@ -74,6 +74,15 @@ def _try_driver(
         if enable_secret:
             optional_args["secret"] = enable_secret
 
+        # NX-OS (especially Nexus 7000) can be slow to respond after each command
+        # due to supervisor latency.  Without extra delay Netmiko's prompt detection
+        # races ahead and logs "Pattern not detected: 'HOSTNAME\#' in output" for
+        # every CLI call after the first.  Doubling the global delay factor and
+        # disabling fast_cli gives the device enough time to send its prompt.
+        if driver_name == "nxos_ssh":
+            optional_args["global_delay_factor"] = 2
+            optional_args["fast_cli"] = False
+
         device = driver_cls(
             hostname=ip,
             username=username,
