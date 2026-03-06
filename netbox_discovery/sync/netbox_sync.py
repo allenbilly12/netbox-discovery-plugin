@@ -195,11 +195,14 @@ def sync_device(
             device.serial = serial
             changed = True
         if os_version:
-            cf = device.custom_field_data or {}
-            if cf.get("os_version") != os_version:
-                cf["os_version"] = os_version
-                device.custom_field_data = cf
-                changed = True
+            try:
+                cf = device.custom_field_data or {}
+                if cf.get("os_version") != os_version:
+                    cf["os_version"] = os_version
+                    device.custom_field_data = cf
+                    changed = True
+            except Exception as exc:
+                log_fn(f"  [WARN] Could not set os_version custom field: {exc}")
         if changed:
             device.save()
 

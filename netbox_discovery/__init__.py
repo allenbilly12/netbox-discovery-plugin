@@ -22,5 +22,43 @@ class DiscoveryConfig(PluginConfig):
 
     required_config = []
 
+    def ready(self):
+        super().ready()
+        # Ensure the os_version custom field exists on Device so that
+        # netbox_sync.py can write to custom_field_data["os_version"].
+        # Wrapped in a broad except so a missing table during initial
+        # migrations never prevents the plugin from loading.
+        try:
+            _ensure_os_version_custom_field()
+        except Exception:
+            pass
+
+
+def _ensure_os_version_custom_field():
+    from django.contrib.contenttypes.models import ContentType
+    from extras.models import CustomField
+
+    # NetBox 4.x uses TYPE_TEXT; fall back gracefully if the choice moves.
+    try:
+        from extras.choices import CustomFieldTypeChoices
+        cf_type = CustomFieldTypeChoices.TYPE_TEXT
+    except (ImportError, AttributeError):
+        cf_type = "text"
+
+    from dcim.models import Device
+    device_ct = ContentType.objects.get_for_model(Device)
+
+    cf, _ = CustomField.objects.get_or_create(
+        name="os_version",
+        defaults={
+            "label": "OS Version",
+            "type": cf_type,
+            "description": "Device OS version collected by network discovery",
+        },
+    )
+    # Ensure Device is in the field's object_types (ManyToMany)
+    if device_ct not in cf.object_types.all():
+        cf.object_types.add(device_ct)
+
 
 config = DiscoveryConfig
