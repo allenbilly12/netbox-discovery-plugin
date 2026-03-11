@@ -27,6 +27,7 @@ class DiscoveryJob(JobRunner):
 
     class Meta:
         name = "Network Discovery"
+        timeout = JOB_TIMEOUT
 
     def run(self, data, commit=True):
         from .models import DiscoveryRun, DiscoveryTarget

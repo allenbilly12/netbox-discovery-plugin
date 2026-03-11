@@ -2,6 +2,7 @@ import logging
 from collections import defaultdict
 
 from django.contrib import messages
+from django.core.paginator import Paginator
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -56,9 +57,15 @@ class DuplicateDevicesView(View):
             if len(devs) > 1
         ]
 
+        paginator = Paginator(duplicates, 25)
+        page_number = request.GET.get("page", 1)
+        page_obj = paginator.get_page(page_number)
+
         return render(request, self.template_name, {
-            "duplicates": duplicates,
+            "duplicates": page_obj,
             "duplicate_group_count": len(duplicates),
+            "page_obj": page_obj,
+            "paginator": paginator,
         })
 
 

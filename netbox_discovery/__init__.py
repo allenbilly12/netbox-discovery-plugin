@@ -24,6 +24,8 @@ class DiscoveryConfig(PluginConfig):
 
     def ready(self):
         super().ready()
+        # Import jobs module so @system_job registers discovery_scheduler with NetBox.
+        import netbox_discovery.jobs  # noqa: F401
         # Defer the os_version custom field creation to post_migrate so we
         # don't touch the DB during app initialisation (avoids RuntimeWarning).
         from django.db.models.signals import post_migrate
