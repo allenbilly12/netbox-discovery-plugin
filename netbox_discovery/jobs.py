@@ -292,31 +292,33 @@ try:
     from netbox.jobs import system_job
 
     @system_job(interval=5)
-    def discovery_scheduler(**kwargs):
+    class DiscoveryScheduler(JobRunner):
         """
         Runs every 5 minutes. Enqueues DiscoveryJob for any enabled targets
         whose scan_interval has elapsed since last_run.
         """
-        from .models import DiscoveryTarget
 
-        now = timezone.now()
-        for target in DiscoveryTarget.objects.filter(enabled=True, scan_interval__gt=0):
-            if target.last_run is None:
-                due = True
-            else:
-                elapsed_minutes = (now - target.last_run).total_seconds() / 60
-                due = elapsed_minutes >= target.scan_interval
+        class Meta:
+            name = "Discovery Scheduler"
 
-            if due:
-                logger.info(
-                    "Scheduling DiscoveryJob for '%s' (interval=%d min)",
-                    target.name,
-                    target.scan_interval,
-                )
-                DiscoveryJob.enqueue(data={"target_id": target.pk})
+        def run(self, **kwargs):
+            from .models import DiscoveryTarget
 
-    # NetBox's rqworker accesses job.name; plain functions only have __name__.
-    discovery_scheduler.name = "discovery_scheduler"
+            now = timezone.now()
+            for target in DiscoveryTarget.objects.filter(enabled=True, scan_interval__gt=0):
+                if target.last_run is None:
+                    due = True
+                else:
+                    elapsed_minutes = (now - target.last_run).total_seconds() / 60
+                    due = elapsed_minutes >= target.scan_interval
+
+                if due:
+                    logger.info(
+                        "Scheduling DiscoveryJob for '%s' (interval=%d min)",
+                        target.name,
+                        target.scan_interval,
+                    )
+                    DiscoveryJob.enqueue(data={"target_id": target.pk})
 
 except ImportError:
     logger.warning(
