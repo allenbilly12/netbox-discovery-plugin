@@ -315,6 +315,9 @@ try:
                 )
                 DiscoveryJob.enqueue(data={"target_id": target.pk})
 
+    # NetBox's rqworker accesses job.name; plain functions only have __name__.
+    discovery_scheduler.name = "discovery_scheduler"
+
 except ImportError:
     logger.warning(
         "netbox.jobs.system_job not available — periodic scheduling disabled."
