@@ -89,7 +89,7 @@ class MergeDevicesView(View):
         duplicate = get_object_or_404(Device, pk=delete_id)
 
         holding_site_name = (
-            settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get("holding_site", "Holding")
+            settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get("holding_site_name", "Holding")
         )
 
         changed = False

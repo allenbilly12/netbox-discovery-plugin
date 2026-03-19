@@ -11,6 +11,8 @@ import os
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from netbox_discovery.sync.classify import classify_device
+
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
 
 # ---------------------------------------------------------------------------
@@ -180,8 +182,11 @@ def sync_device(
             dtype.slug = make_slug(f"{vendor}-{model}")
             dtype.save()
 
-        # --- DeviceRole ---
-        role = _ensure_role("Network Device")
+        # --- DeviceRole (auto-classify by model / driver) ---
+        driver = (data.get("driver") or "").strip()
+        classification = classify_device(model=model, vendor=vendor, driver=driver)
+        role = _ensure_role(classification["role"], color=classification["color"])
+        log_fn(f"  Auto-classified role: {classification['role']} (model={model})")
 
         # --- Device: match by hostname, then by primary IP ---
         device, was_created = _get_or_create_device(
@@ -218,8 +223,16 @@ def sync_device(
                 changed = True
                 log_fn(f"  Auto-assigned site '{matched_site.name}' from hostname prefix.")
 
+        # Update role if classification improved (e.g. model was unknown before)
+        if device.role_id != role.pk:
+            device.role = role
+            changed = True
+
         if changed:
             device.save()
+
+        # --- Auto-assign tags based on classification ---
+        _sync_device_tags(device, classification["tags"], log_fn)
 
         # --- Interfaces ---
         _sync_interfaces(device, interfaces_raw, log_fn)
@@ -290,6 +303,8 @@ def sync_device(
                 site=site,
                 master_dtype=dtype,
                 role=role,
+                driver=driver,
+                vendor=vendor,
                 log_fn=log_fn,
             )
 
@@ -316,18 +331,49 @@ def _ensure_site(name: str):
     return site
 
 
-def _ensure_role(name: str):
+def _ensure_role(name: str, color: str = "9e9e9e"):
     from dcim.models import DeviceRole
 
     role = DeviceRole.objects.filter(name__iexact=name).first()
     if role is None:
         role, created = DeviceRole.objects.get_or_create(
             name=name,
-            defaults={"slug": make_slug(name), "color": "2196f3"},
+            defaults={"slug": make_slug(name), "color": color},
         )
         if created:
             logger.info("Created device role: %s", name)
     return role
+
+
+def _sync_device_tags(device, tag_slugs: List[str], log_fn: Callable):
+    """
+    Ensure the device has all auto-classified tags attached.
+    Creates tags that don't exist yet. Never removes existing tags.
+    """
+    from extras.models import Tag
+
+    if not tag_slugs:
+        return
+
+    existing_slugs = set(device.tags.values_list("slug", flat=True))
+    added = []
+
+    for slug in tag_slugs:
+        if slug in existing_slugs:
+            continue
+        tag = Tag.objects.filter(slug=slug).first()
+        if tag is None:
+            # Create with a human-readable name (capitalize, replace hyphens)
+            display_name = slug.replace("-", " ").title()
+            tag, created = Tag.objects.get_or_create(
+                slug=slug,
+                defaults={"name": display_name},
+            )
+        device.tags.add(tag)
+        added.append(slug)
+
+    if added:
+        log_fn(f"  Auto-tagged: {', '.join(added)}")
 
 
 def _base_hostname(name: str) -> str:
@@ -572,7 +618,9 @@ def _sync_virtual_chassis(
     site,
     master_dtype,
     role,
-    log_fn: Callable,
+    driver: str = "",
+    vendor: str = "",
+    log_fn: Callable = None,
 ):
     """
     Create / update a VirtualChassis for a Cisco StackWise stack.
@@ -663,12 +711,20 @@ def _sync_virtual_chassis(
             or Device.objects.filter(name=member_name).first()
         )
 
+        # Classify member by its own model (may differ in mixed-model stacks)
+        member_cls = classify_device(
+            model=member_model or master_dtype.model,
+            vendor=vendor,
+            driver=driver,
+        )
+        member_role = _ensure_role(member_cls["role"], color=member_cls["color"])
+
         if mem_dev is None:
             mem_dev = Device.objects.create(
                 name=member_name,
                 site=master_device.site,
                 device_type=member_dtype,
-                role=role,
+                role=member_role,
                 serial=member_serial,
                 status="active",
                 virtual_chassis=vc,
@@ -702,6 +758,9 @@ def _sync_virtual_chassis(
                     f"  [Stack] Updated member '{mem_dev.name}' "
                     f"pos={pos} serial={member_serial or 'N/A'}"
                 )
+
+        # Auto-tag member device
+        _sync_device_tags(mem_dev, member_cls["tags"], log_fn)
 
 
 def _sync_vlans(vlans_raw: Dict, site, log_fn: Callable):

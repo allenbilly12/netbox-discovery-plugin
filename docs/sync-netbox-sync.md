@@ -14,17 +14,18 @@ Main entry point. Called once per device from `jobs.py`'s `on_device` callback.
 
 1. **Hostname sanitization** — `_is_valid_hostname()` rejects CLI errors (`^`, `% Invalid input`), OS identifiers (`Kernel`, `localhost`), etc. Falls back to `mgmt_ip` as hostname.
 2. **Manufacturer / DeviceType** — `get_or_create` with slug generation.
-3. **DeviceRole** — `get_or_create` for `"Network Device"`.
+3. **DeviceRole (auto-classified)** — `classify_device()` from `sync/classify.py` maps the model string + NAPALM driver to a specific role (Router, Switch, Firewall, Wireless AP, etc.) with a color. Falls back to driver-based inference, then `"Network Device"`.
 4. **Device lookup** — `_get_or_create_device()`: exact hostname → primary IP → domain-variant base hostname → create new.
-5. **Update mutable fields** — device_type, serial, os_version custom field.
+5. **Update mutable fields** — device_type, serial, os_version custom field, role (re-classified on each sync).
 6. **Hostname-to-site matching** — `_match_site_by_hostname()`: if device is on holding site, try to find a real site whose name is a prefix of the hostname (e.g. `GBLON10SWI01` → site `GBLON10`).
-7. **Interfaces** — `_sync_interfaces()`: `get_or_create` each interface, update enabled/description/MTU/MAC.
-8. **IP Addresses** — `_sync_ips()`: `get_or_create` each IP, assign to interface. Returns management IP object.
-9. **Primary IP** — set `device.primary_ip4`. If conflict detected:
+7. **Auto-tagging** — `_sync_device_tags()` applies classification-derived tags (vendor, device type, series) to the device. Tags are additive — never removed.
+8. **Interfaces** — `_sync_interfaces()`: `get_or_create` each interface, update enabled/description/MTU/MAC.
+9. **IP Addresses** — `_sync_ips()`: `get_or_create` each IP, assign to interface. Returns management IP object.
+10. **Primary IP** — set `device.primary_ip4`. If conflict detected:
    - If blocker is a **domain-variant** (same base hostname): auto-resolve by clearing blocker's primary IP.
    - Otherwise: log WARNING to conflict file and skip.
-10. **VLANs** — `_sync_vlans()`: `get_or_create` each VLAN scoped to holding site.
-11. **Virtual Chassis** — `_sync_virtual_chassis()`: if `stack_members > 1`, create/update VC + member devices.
+11. **VLANs** — `_sync_vlans()`: `get_or_create` each VLAN scoped to holding site.
+12. **Virtual Chassis** — `_sync_virtual_chassis()`: if `stack_members > 1`, create/update VC + member devices.
 
 ---
 
@@ -87,3 +88,5 @@ IP conflicts that cannot be auto-resolved are written to `/var/log/netbox/discov
 - **Add a new invalid hostname pattern**: Add to `_INVALID_HOSTNAME_EXACT` (set) or `_INVALID_HOSTNAME_FRAGMENTS` (substring list).
 - **Add a new interface abbreviation**: Add to `_IFACE_EXPANSIONS` list — keep sorted longest-prefix-first.
 - **Change cable sync behaviour**: Edit `sync_cables()` — the `frozenset` dedup and `cable_id` skip are the two idempotency guards.
+- **Add a new device classification rule**: Add a tuple to `_RULES` in `sync/classify.py`. Pattern order matters — specific patterns before generic ones. Each rule is `(regex_pattern, role_name, [tag_slugs])`.
+- **Add a new vendor for driver-based fallback**: Add to `DRIVER_ROLE_FALLBACK` and `DRIVER_VENDOR_TAG` dicts in `sync/classify.py`.

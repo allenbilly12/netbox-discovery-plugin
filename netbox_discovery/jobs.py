@@ -109,6 +109,7 @@ class DiscoveryJob(JobRunner):
             # Step 2: BFS crawl + NetBox sync
             def on_device(ip, device_data, driver_name):
                 try:
+                    device_data["driver"] = driver_name
                     device_name, was_created = sync_device(
                         mgmt_ip=ip,
                         data=device_data,
