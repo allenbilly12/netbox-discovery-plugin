@@ -35,6 +35,7 @@ Bare NAPALM connection attempt. Sets `optional_args` for:
 - `ssh_strict=False` — skip strict host key checking
 - `disabled_algorithms` — accept legacy RSA ciphers for older IOS
 - `secret` — enable password (if provided)
+- `read_timeout` — Netmiko per-command read timeout: `max(timeout*3, 60)` for most drivers, `max(timeout*5, 90)` for NX-OS. Prevents "Pattern not detected" errors on devices with large command output (e.g. stacked switches with 100+ interfaces).
 
 ---
 

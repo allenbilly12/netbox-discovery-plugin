@@ -70,6 +70,18 @@ def _try_driver(
             "disabled_algorithms": {
                 "pubkeys": ["rsa-sha2-256", "rsa-sha2-512"],
             },
+            # ---- Netmiko read_timeout -------------------------------------------
+            # Netmiko's default read_timeout is 10 s, which is far too short for
+            # devices that produce large output (e.g. 'show interfaces' on a
+            # Catalyst 3850 stack with 144 ports, or 'show ip interface' on a
+            # router with many SVIs).  The "Pattern not detected" errors in the
+            # logs are Netmiko giving up before the device finishes sending.
+            # Scale the read_timeout generously: 3× the SSH timeout (min 60 s)
+            # for normal drivers, 5× (min 90 s) for NX-OS which is notoriously
+            # slow.  The outer collect_timeout in neighbor.py already caps the
+            # total wall-clock time per device so this cannot stall forever.
+            "read_timeout": max(timeout * 5, 90) if driver_name == "nxos_ssh"
+                            else max(timeout * 3, 60),
         }
         if enable_secret:
             optional_args["secret"] = enable_secret
@@ -78,10 +90,9 @@ def _try_driver(
             hostname=ip,
             username=username,
             password=password,
-            # NX-OS devices (especially Nexus 7000) run slow commands like
-            # 'show interfaces' that can take 10+ seconds on large chassis.
-            # Pass a higher timeout for nxos_ssh so Netmiko waits long enough
-            # for each command's prompt rather than declaring it missing.
+            # conn_timeout: how long to wait for the initial TCP/SSH handshake.
+            # NX-OS gets extra headroom because SSH negotiation is slow on
+            # Nexus 7000 / 9000 with many VDCs / VRFs.
             timeout=max(timeout * 3, 30) if driver_name == "nxos_ssh" else timeout,
             optional_args=optional_args,
         )
@@ -130,13 +141,13 @@ def _try_driver_timed(
     with a deadline prevents a single slow driver from stalling the entire
     discovery job.
     """
-    # nxos_ssh uses a 3x higher NAPALM timeout to allow slow NX-OS commands
-    # (e.g. 'show interfaces' on a Nexus 7000 with 100+ interfaces) to complete.
-    # The wall-clock deadline must be at least as large as that extended timeout.
+    # Wall-clock deadline must cover: TCP connect + SSH handshake + get_facts().
+    # get_facts() sends 1-2 CLI commands, each of which may take up to
+    # read_timeout seconds.  Add headroom for the connection phase.
     if driver_name == "nxos_ssh":
-        deadline = max(timeout * 3, 30) + 4
+        deadline = max(timeout * 5, 90) + max(timeout * 3, 30) + 5
     else:
-        deadline = timeout + 2
+        deadline = max(timeout * 3, 60) + timeout + 5
 
     # Do NOT use 'with ThreadPoolExecutor(...) as executor:' here.
     # The context manager calls shutdown(wait=True) on __exit__, which blocks

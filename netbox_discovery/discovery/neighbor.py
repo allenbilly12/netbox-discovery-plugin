@@ -65,8 +65,14 @@ def crawl(
     if stop_flag is None:
         stop_flag = lambda: False
 
-    # Per-device data-collection timeout: enough headroom for all NAPALM calls
-    collect_timeout = max(timeout * 6, 60)
+    # Per-device data-collection wall-clock timeout.
+    # The collector runs 5 sequential NAPALM calls (get_facts, get_interfaces,
+    # get_interfaces_ip, get_vlans, neighbors).  Each call may take up to
+    # read_timeout seconds (max(timeout*3, 60) for most drivers).  On large
+    # devices (e.g. 3850 stacks with 144 ports), show interfaces alone can
+    # take 30-50s.  Allow enough room for all calls plus CDP CLI parsing.
+    read_timeout = max(timeout * 3, 60)
+    collect_timeout = read_timeout * 5 + 30  # 5 calls + 30s headroom
 
     # Thread-safe work queue; each item is (ip, depth) or None (poison pill).
     work_queue: _queue_mod.Queue = _queue_mod.Queue()
