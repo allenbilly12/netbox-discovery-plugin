@@ -135,6 +135,7 @@ def sync_device(
 
     facts = data.get("facts", {})
     interfaces_raw = data.get("interfaces", {})
+    lag_members = data.get("lag_members", {})
     interfaces_ip = data.get("interfaces_ip", {})
     vlans_raw = data.get("vlans", {})
     stack_members = data.get("stack_members", [])
@@ -236,6 +237,7 @@ def sync_device(
 
         # --- Interfaces ---
         _sync_interfaces(device, interfaces_raw, log_fn)
+        _sync_lag_members(device, lag_members, log_fn)
 
         # --- IP Addresses ---
         primary_ip = _sync_ips(device, interfaces_ip, mgmt_ip, log_fn)
@@ -526,6 +528,9 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable):
         mtu = iface_data.get("mtu") or None
         mac = (iface_data.get("mac_address") or "").upper() or None
 
+        if iface.type != iface_type:
+            iface.type = iface_type
+            changed = True
         if iface.enabled != enabled:
             iface.enabled = enabled
             changed = True
@@ -544,6 +549,84 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable):
 
         if changed:
             iface.save()
+
+
+def _sync_lag_members(device, lag_members: Dict[str, List[str]], log_fn: Callable):
+    from dcim.models import Interface
+
+    if not lag_members:
+        return
+
+    lag_field_supported = hasattr(Interface, "lag")
+    if not lag_field_supported:
+        log_fn("  [WARN] Interface LAG relationships are not supported by this NetBox version.")
+        return
+
+    managed_lags = {}
+    desired_members_by_lag_id: Dict[int, set] = {}
+
+    for lag_name, member_names in lag_members.items():
+        lag_iface = _find_interface(device, lag_name)
+        if lag_iface is None:
+            lag_iface, _ = Interface.objects.get_or_create(
+                device=device,
+                name=lag_name,
+                defaults={"type": "lag"},
+            )
+        elif lag_iface.type != "lag":
+            lag_iface.type = "lag"
+            lag_iface.save()
+
+        managed_lags[lag_iface.pk] = lag_iface
+        desired_member_names = set()
+
+        for member_name in member_names:
+            member_iface = _find_interface(device, member_name)
+            if member_iface is None:
+                member_iface, _ = Interface.objects.get_or_create(
+                    device=device,
+                    name=member_name,
+                    defaults={"type": map_interface_type(member_name)},
+                )
+            desired_member_names.add(member_iface.name)
+
+            current_lag = getattr(member_iface, "lag", None)
+            if getattr(member_iface, "lag_id", None) != lag_iface.pk:
+                old_lag_desc = current_lag.name if current_lag else "none"
+                member_iface.lag = lag_iface
+                member_iface.save()
+                log_fn(
+                    f"  [LAG] {device.name}/{member_iface.name} joined {lag_iface.name} "
+                    f"(previous={old_lag_desc})."
+                )
+                _add_journal_entry(
+                    member_iface,
+                    (
+                        f"Discovery updated LAG membership on {device.name}: interface "
+                        f"{member_iface.name} moved from {old_lag_desc} to {lag_iface.name}."
+                    ),
+                )
+
+        desired_members_by_lag_id[lag_iface.pk] = desired_member_names
+
+    for iface in Interface.objects.filter(device=device).exclude(lag__isnull=True).select_related("lag"):
+        current_lag_id = getattr(iface, "lag_id", None)
+        if current_lag_id not in managed_lags:
+            continue
+        if iface.name in desired_members_by_lag_id.get(current_lag_id, set()):
+            continue
+
+        old_lag = iface.lag
+        iface.lag = None
+        iface.save()
+        log_fn(f"  [LAG] {device.name}/{iface.name} removed from {old_lag.name}.")
+        _add_journal_entry(
+            iface,
+            (
+                f"Discovery removed interface {iface.name} from LAG {old_lag.name} "
+                f"on {device.name} because it is no longer reported as a member."
+            ),
+        )
 
 
 def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
@@ -580,8 +663,40 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
                     },
                 )
 
-                # Re-assign if orphaned
-                if ip_obj.assigned_object_id != iface.pk:
+                # Only move an existing IP when it's unassigned or already belongs
+                # to this device. Never steal an IP from another device.
+                assigned_object = ip_obj.assigned_object
+                assigned_device = getattr(assigned_object, "device", None)
+                if (
+                    assigned_object is not None
+                    and assigned_device is not None
+                    and assigned_device.pk != device.pk
+                ):
+                    assigned_desc = f"{assigned_device.name}/{assigned_object.name}"
+                    warn_msg = (
+                        f"  [WARN] IP conflict — leaving {cidr} on {assigned_desc}; "
+                        f"not reassigning it to {device.name}/{iface.name}."
+                    )
+                    log_fn(warn_msg)
+                    _get_conflict_logger().warning(
+                        "INTERFACE IP CONFLICT | wanted_device=%s (id=%s) | "
+                        "blocking_device=%s (id=%s) | ip=%s (id=%s) | "
+                        "wanted_interface=%s | blocking_interface=%s",
+                        device.name,
+                        device.pk,
+                        assigned_device.name,
+                        assigned_device.pk,
+                        cidr,
+                        ip_obj.pk,
+                        iface.name,
+                        assigned_object.name,
+                    )
+                    continue
+
+                if (
+                    ip_obj.assigned_object_type_id != iface_ct.id
+                    or ip_obj.assigned_object_id != iface.pk
+                ):
                     ip_obj.assigned_object_type = iface_ct
                     ip_obj.assigned_object_id = iface.pk
                     ip_obj.save()
@@ -776,11 +891,21 @@ def _sync_vlans(vlans_raw: Dict, site, log_fn: Callable):
             continue
 
         vlan_name = vlan_data.get("name") or f"VLAN{vid}"
-        vlan, created = VLAN.objects.get_or_create(
-            vid=vid,
-            site=site,
-            defaults={"name": vlan_name, "status": "active"},
-        )
+        matches = VLAN.objects.filter(vid=vid, site=site)
+        vlan = matches.first()
+        created = vlan is None
+        if vlan is None:
+            vlan = VLAN.objects.create(
+                vid=vid,
+                site=site,
+                name=vlan_name,
+                status="active",
+            )
+        elif matches.count() > 1:
+            log_fn(
+                f"  [WARN] Found {matches.count()} VLAN rows for VID {vid} at site {site}; "
+                f"using VLAN id={vlan.pk}."
+            )
         if not created and vlan.name != vlan_name and vlan.name == f"VLAN{vid}":
             # Update auto-generated names with the real name
             vlan.name = vlan_name
@@ -858,6 +983,115 @@ def _find_interface(device, name: str):
     return None
 
 
+def _describe_termination(term) -> str:
+    if term is None:
+        return "unassigned"
+    device = getattr(term, "device", None)
+    if device is not None:
+        return f"{device.name}/{term.name}"
+    return str(term)
+
+
+def _as_termination_list(value) -> List[Any]:
+    if value is None:
+        return []
+    if hasattr(value, "all"):
+        return list(value.all())
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _get_cable_endpoints(cable) -> Tuple[Optional[Any], Optional[Any]]:
+    a_terms = _as_termination_list(getattr(cable, "a_terminations", None))
+    b_terms = _as_termination_list(getattr(cable, "b_terminations", None))
+    return (a_terms[0] if a_terms else None, b_terms[0] if b_terms else None)
+
+
+def _set_cable_endpoints(cable, a_term, b_term) -> None:
+    for attr, value in (("a_terminations", a_term), ("b_terminations", b_term)):
+        current = getattr(cable, attr, None)
+        if hasattr(current, "set"):
+            current.set([value])
+        else:
+            setattr(cable, attr, [value])
+    cable.full_clean()
+    cable.save()
+
+
+def _journal_kind_info():
+    try:
+        from extras.choices import JournalEntryKindChoices
+
+        for attr in ("KIND_INFO", "TYPE_INFO", "INFO"):
+            if hasattr(JournalEntryKindChoices, attr):
+                return getattr(JournalEntryKindChoices, attr)
+    except Exception:
+        pass
+    return "info"
+
+
+def _add_journal_entry(obj, message: str) -> bool:
+    if obj is None or not message:
+        return False
+
+    try:
+        from extras.models import JournalEntry
+    except Exception:
+        return False
+
+    kwargs = {
+        "assigned_object": obj,
+        "kind": _journal_kind_info(),
+        "comments": message,
+    }
+    try:
+        JournalEntry.objects.create(**kwargs)
+        return True
+    except TypeError:
+        kwargs.pop("comments", None)
+        kwargs["comment"] = message
+        try:
+            JournalEntry.objects.create(**kwargs)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def _update_cable_connection(cable, fixed_term, new_other_term, log_fn: Callable) -> bool:
+    a_term, b_term = _get_cable_endpoints(cable)
+    if a_term is None or b_term is None:
+        return False
+
+    if a_term.pk == fixed_term.pk:
+        old_other = b_term
+        new_a, new_b = fixed_term, new_other_term
+    elif b_term.pk == fixed_term.pk:
+        old_other = a_term
+        new_a, new_b = new_other_term, fixed_term
+    else:
+        return False
+
+    if old_other.pk == new_other_term.pk:
+        return False
+
+    _set_cable_endpoints(cable, new_a, new_b)
+
+    message = (
+        "Discovery updated this connection based on the latest neighbor data: "
+        f"{_describe_termination(fixed_term)} moved from {_describe_termination(old_other)} "
+        f"to {_describe_termination(new_other_term)}."
+    )
+    _add_journal_entry(cable, message)
+    _add_journal_entry(getattr(fixed_term, "device", None), message)
+    _add_journal_entry(getattr(old_other, "device", None), message)
+    _add_journal_entry(getattr(new_other_term, "device", None), message)
+    log_fn(f"  [Cable] Updated {_describe_termination(fixed_term)}: {_describe_termination(old_other)} -> {_describe_termination(new_other_term)}")
+    return True
+
+
 def sync_cables(neighbor_records: List[Dict], log_fn: Optional[Callable] = None) -> int:
     """
     Create NetBox Cable objects from collected CDP/LLDP neighbor data.
@@ -876,6 +1110,7 @@ def sync_cables(neighbor_records: List[Dict], log_fn: Optional[Callable] = None)
     created = 0
     # frozenset of (iface_pk_a, iface_pk_b) — deduplicates A→B / B→A within this run
     seen: set = set()
+    processed_cables: set = set()
 
     for record in neighbor_records:
         local_hostname = record.get("hostname", "")
@@ -903,18 +1138,36 @@ def sync_cables(neighbor_records: List[Dict], log_fn: Optional[Callable] = None)
             if not remote_iface:
                 continue
 
-            # Skip if either interface is already cabled
-            if local_iface.cable_id or remote_iface.cable_id:
+            desired_key = frozenset({local_iface.pk, remote_iface.pk})
+            if desired_key in seen:
                 continue
+            seen.add(desired_key)
 
-            # Deduplicate bidirectional reports (A→B seen from both A and B)
-            key = frozenset({local_iface.pk, remote_iface.pk})
-            if key in seen:
+            if local_iface.cable_id and remote_iface.cable_id:
+                if local_iface.cable_id == remote_iface.cable_id:
+                    continue
+                log_fn(
+                    f"  [Cable] SKIP {_describe_termination(local_iface)} ↔ "
+                    f"{_describe_termination(remote_iface)}: both interfaces already have different cables."
+                )
                 continue
-            seen.add(key)
 
             try:
                 with transaction.atomic():
+                    if local_iface.cable_id:
+                        if local_iface.cable_id in processed_cables:
+                            continue
+                        if _update_cable_connection(local_iface.cable, local_iface, remote_iface, log_fn):
+                            processed_cables.add(local_iface.cable_id)
+                        continue
+
+                    if remote_iface.cable_id:
+                        if remote_iface.cable_id in processed_cables:
+                            continue
+                        if _update_cable_connection(remote_iface.cable, remote_iface, local_iface, log_fn):
+                            processed_cables.add(remote_iface.cable_id)
+                        continue
+
                     cable = Cable(
                         a_terminations=[local_iface],
                         b_terminations=[remote_iface],
@@ -923,6 +1176,7 @@ def sync_cables(neighbor_records: List[Dict], log_fn: Optional[Callable] = None)
                     cable.full_clean()
                     cable.save()
                     created += 1
+                    processed_cables.add(cable.pk)
                     log_fn(
                         f"  [Cable] {local_device.name}/{local_iface.name}"
                         f" ↔ {remote_device.name}/{remote_iface.name}"

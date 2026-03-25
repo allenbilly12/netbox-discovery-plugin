@@ -5,6 +5,7 @@ Collects:
 - Facts (hostname, vendor, model, serial, os_version)
 - Stack members (Cisco IOS only): position, role, serial, model via show switch + show inventory
 - Interfaces (name, enabled, description, mtu, mac)
+- LAG / port-channel membership (best-effort for Cisco IOS/NX-OS)
 - Interface IPs (including VLAN SVIs)
 - VLANs (if driver supports it)
 - LLDP/CDP neighbors (for recursive discovery)
@@ -42,6 +43,7 @@ def collect_device_data(
     result = {
         "facts": {},
         "interfaces": {},
+        "lag_members": {},
         "interfaces_ip": {},
         "vlans": {},
         "neighbors": [],
@@ -73,12 +75,32 @@ def collect_device_data(
         logger.warning(msg)
         result["raw_errors"].append(msg)
 
+    # --- LAG / Port-channel members ---
+    log_fn("    [3/6] LAG member discovery...")
+    t0 = time.monotonic()
+    try:
+        result["lag_members"] = _collect_lag_members(device, driver_name)
+        lag_count = len(result["lag_members"])
+        member_count = sum(len(members) for members in result["lag_members"].values())
+        if lag_count:
+            log_fn(
+                f"    [3/6] LAG member discovery done ({time.monotonic()-t0:.1f}s) "
+                f"— {lag_count} bundle(s), {member_count} member(s)"
+            )
+        else:
+            log_fn(f"    [3/6] LAG member discovery done ({time.monotonic()-t0:.1f}s) — none found")
+    except Exception as exc:
+        msg = f"LAG member discovery failed ({time.monotonic()-t0:.1f}s): {exc}"
+        log_fn(f"    [WARN] {msg}")
+        logger.warning(msg)
+        result["raw_errors"].append(msg)
+
     # --- Interface IPs (L3 + VLAN SVIs) ---
-    log_fn("    [3/5] get_interfaces_ip()...")
+    log_fn("    [4/6] get_interfaces_ip()...")
     t0 = time.monotonic()
     try:
         result["interfaces_ip"] = device.get_interfaces_ip()
-        log_fn(f"    [3/5] get_interfaces_ip() done ({time.monotonic()-t0:.1f}s) — {len(result['interfaces_ip'])} L3 interfaces")
+        log_fn(f"    [4/6] get_interfaces_ip() done ({time.monotonic()-t0:.1f}s) — {len(result['interfaces_ip'])} L3 interfaces")
     except Exception as exc:
         msg = f"get_interfaces_ip() failed ({time.monotonic()-t0:.1f}s): {exc}"
         log_fn(f"    [WARN] {msg}")
@@ -86,18 +108,18 @@ def collect_device_data(
         result["raw_errors"].append(msg)
 
     # --- VLANs ---
-    log_fn("    [4/5] get_vlans()...")
+    log_fn("    [5/6] get_vlans()...")
     t0 = time.monotonic()
     try:
         result["vlans"] = device.get_vlans()
-        log_fn(f"    [4/5] get_vlans() done ({time.monotonic()-t0:.1f}s) — {len(result['vlans'])} VLANs")
+        log_fn(f"    [5/6] get_vlans() done ({time.monotonic()-t0:.1f}s) — {len(result['vlans'])} VLANs")
     except Exception as exc:
         # Many drivers don't support get_vlans(); treat as non-fatal
-        log_fn(f"    [4/5] get_vlans() not supported ({time.monotonic()-t0:.1f}s) — skipped")
+        log_fn(f"    [5/6] get_vlans() not supported ({time.monotonic()-t0:.1f}s) — skipped")
         logger.debug("get_vlans() not supported or failed: %s", exc)
 
     # --- Neighbors (LLDP / CDP) ---
-    log_fn(f"    [5/5] neighbor discovery (protocol={discovery_protocol})...")
+    log_fn(f"    [6/7] neighbor discovery (protocol={discovery_protocol})...")
     t0 = time.monotonic()
     neighbors = []
     if discovery_protocol in ("lldp", "both"):
@@ -115,7 +137,7 @@ def collect_device_data(
                             "remote_description": n.get("remote_system_description", ""),
                         }
                     )
-            log_fn(f"    [5/5] LLDP detail: {len(neighbors)} neighbors ({time.monotonic()-t0:.1f}s)")
+            log_fn(f"    [6/7] LLDP detail: {len(neighbors)} neighbors ({time.monotonic()-t0:.1f}s)")
         except Exception as exc:
             logger.debug("get_lldp_neighbors_detail() failed: %s", exc)
             # Try basic LLDP
@@ -133,37 +155,37 @@ def collect_device_data(
                                 "remote_description": "",
                             }
                         )
-                log_fn(f"    [5/5] LLDP basic: {len(neighbors)} neighbors ({time.monotonic()-t0:.1f}s)")
+                log_fn(f"    [6/7] LLDP basic: {len(neighbors)} neighbors ({time.monotonic()-t0:.1f}s)")
             except Exception as exc2:
-                log_fn(f"    [5/5] LLDP not available ({time.monotonic()-t0:.1f}s)")
+                log_fn(f"    [6/7] LLDP not available ({time.monotonic()-t0:.1f}s)")
                 logger.debug("get_lldp_neighbors() also failed: %s", exc2)
 
     if discovery_protocol in ("cdp", "both"):
         # NAPALM exposes CDP via get_lldp_neighbors on IOS; also try cli for explicit CDP
         cdp_t0 = time.monotonic()
-        log_fn("    [5/5] CDP: running 'show cdp neighbors detail'...")
+        log_fn("    [6/7] CDP: running 'show cdp neighbors detail'...")
         try:
             cdp_data = _get_cdp_via_cli(device, driver_name)
             neighbors.extend(cdp_data)
-            log_fn(f"    [5/5] CDP: {len(cdp_data)} neighbors ({time.monotonic()-cdp_t0:.1f}s)")
+            log_fn(f"    [6/7] CDP: {len(cdp_data)} neighbors ({time.monotonic()-cdp_t0:.1f}s)")
         except Exception as exc:
-            log_fn(f"    [5/5] CDP failed ({time.monotonic()-cdp_t0:.1f}s): {exc}")
+            log_fn(f"    [6/7] CDP failed ({time.monotonic()-cdp_t0:.1f}s): {exc}")
             logger.debug("CDP CLI collection failed: %s", exc)
 
-    log_fn(f"    [5/5] neighbor discovery done — {len(neighbors)} total neighbors ({time.monotonic()-t0:.1f}s)")
+    log_fn(f"    [6/7] neighbor discovery done — {len(neighbors)} total neighbors ({time.monotonic()-t0:.1f}s)")
     result["neighbors"] = neighbors
 
     # --- Cisco Stack detection (IOS only) ---
-    log_fn("    [6/6] Checking for Cisco StackWise members...")
+    log_fn("    [7/7] Checking for Cisco StackWise members...")
     t0 = time.monotonic()
     stack_members = _detect_cisco_stack(device, driver_name, log_fn)
     if len(stack_members) > 1:
         log_fn(
-            f"    [6/6] Stack detected: {len(stack_members)} member(s) "
+            f"    [7/7] Stack detected: {len(stack_members)} member(s) "
             f"({time.monotonic()-t0:.1f}s)"
         )
     else:
-        log_fn(f"    [6/6] Not a stack or not supported ({time.monotonic()-t0:.1f}s)")
+        log_fn(f"    [7/7] Not a stack or not supported ({time.monotonic()-t0:.1f}s)")
     result["stack_members"] = stack_members
 
     return result
@@ -209,6 +231,72 @@ def _get_cdp_via_cli(device, driver_name: str) -> List[Dict]:
         logger.debug("CDP CLI failed: %s", exc)
 
     return neighbors
+
+
+def _collect_lag_members(device, driver_name: str) -> Dict[str, List[str]]:
+    """
+    Best-effort collection of LAG/port-channel membership via device CLI.
+    """
+    if driver_name not in ("ios", "nxos", "nxos_ssh"):
+        return {}
+
+    commands = ["show etherchannel summary"]
+    if driver_name in ("nxos", "nxos_ssh"):
+        commands.insert(0, "show port-channel summary")
+
+    for command in commands:
+        try:
+            output = device.cli([command]).get(command, "")
+        except Exception as exc:
+            logger.debug("LAG CLI command failed (%s): %s", command, exc)
+            continue
+        lag_members = _parse_lag_summary(output)
+        if lag_members:
+            return lag_members
+
+    return {}
+
+
+def _parse_lag_summary(output: str) -> Dict[str, List[str]]:
+    """
+    Parse IOS/NX-OS etherchannel summary style output.
+    """
+    lag_members: Dict[str, List[str]] = {}
+    current_lag = None
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line.lower().startswith("flags:") or set(line) <= {"-", "+", " "}:
+            continue
+
+        match = re.match(
+            r"^\d+\s+((?:po|port-channel|bundle-ether|be|ae)\S+?)(?:\([^)]+\))?\s+(.*)$",
+            line,
+            re.IGNORECASE,
+        )
+        if match:
+            current_lag = match.group(1)
+            lag_members.setdefault(current_lag, [])
+            _extend_unique(lag_members[current_lag], _extract_lag_member_names(match.group(2)))
+            continue
+
+        if current_lag and not re.match(r"^\d+\s", line):
+            _extend_unique(lag_members[current_lag], _extract_lag_member_names(line))
+
+    return {lag: members for lag, members in lag_members.items() if members}
+
+
+def _extract_lag_member_names(text: str) -> List[str]:
+    members = []
+    for token in re.findall(r"([A-Za-z][A-Za-z0-9./:-]+)(?:\([A-Za-z]+\))", text):
+        members.append(token.rstrip(","))
+    return members
+
+
+def _extend_unique(items: List[str], new_items: List[str]) -> None:
+    for item in new_items:
+        if item not in items:
+            items.append(item)
 
 
 def _detect_cisco_stack(device, driver_name: str, log_fn: Callable) -> List[Dict]:

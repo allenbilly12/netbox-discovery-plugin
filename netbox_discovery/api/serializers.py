@@ -9,9 +9,17 @@ class DiscoveryTargetSerializer(NetBoxModelSerializer):
         view_name="plugins-api:netbox_discovery-api:discoverytarget-detail"
     )
 
-    # Never expose passwords in API responses
-    credential_password = serializers.SerializerMethodField()
-    enable_secret = serializers.SerializerMethodField()
+    # Accept secrets on write without ever returning them in responses.
+    credential_password = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        write_only=True,
+    )
+    enable_secret = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        write_only=True,
+    )
 
     class Meta:
         model = DiscoveryTarget
@@ -30,6 +38,7 @@ class DiscoveryTargetSerializer(NetBoxModelSerializer):
             "discovery_protocol",
             "max_depth",
             "ssh_timeout",
+            "max_workers",
             "scan_interval",
             "enabled",
             "last_run",
@@ -38,12 +47,6 @@ class DiscoveryTargetSerializer(NetBoxModelSerializer):
             "tags",
             "custom_fields",
         )
-
-    def get_credential_password(self, obj):
-        return "********" if obj._credential_password else ""
-
-    def get_enable_secret(self, obj):
-        return "********" if obj._enable_secret else ""
 
 
 class DiscoveryRunSerializer(NetBoxModelSerializer):
@@ -67,6 +70,7 @@ class DiscoveryRunSerializer(NetBoxModelSerializer):
             "devices_updated",
             "errors",
             "log",
+            "device_results",
             "created",
             "last_updated",
         )

@@ -9,6 +9,14 @@
 {% endblock %}
 
 {% block content %}
+<style>
+    .discovery-driver-badge {
+        background-color: #dbeafe;
+        color: #1d4ed8;
+        border: 1px solid #93c5fd;
+        font-weight: 600;
+    }
+</style>
 <div class="row">
 
     {# Summary card #}
@@ -116,7 +124,7 @@
                             <tr>
                                 <td><code>{{ r.ip }}</code></td>
                                 <td>{{ r.hostname|default:"—" }}</td>
-                                <td><span class="badge bg-secondary">{{ r.driver|default:"—" }}</span></td>
+                                <td><span class="badge discovery-driver-badge">{{ r.driver|default:"—" }}</span></td>
                             </tr>
                         {% endfor %}
                         </tbody>
@@ -138,7 +146,7 @@
                             <tr>
                                 <td><code>{{ r.ip }}</code></td>
                                 <td>{{ r.hostname|default:"—" }}</td>
-                                <td><span class="badge bg-secondary">{{ r.driver|default:"—" }}</span></td>
+                                <td><span class="badge discovery-driver-badge">{{ r.driver|default:"—" }}</span></td>
                             </tr>
                         {% endfor %}
                         </tbody>

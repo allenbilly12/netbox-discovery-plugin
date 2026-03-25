@@ -16,8 +16,9 @@
     Groups below contain devices that appear to be the same physical device discovered under
     different domain suffixes (e.g. <code>router1.emea.bcd.local</code> and
     <code>router1.us.bcd.local</code>).
-    <strong>Merge</strong> copies missing serial / OS version data from the duplicate into the
-    keeper and deletes the duplicate. <strong>Delete</strong> removes a device without merging.
+    <strong>Merge</strong> now preserves interface, IP, and cable state where it can, and will stop
+    if it finds conflicting cabling on the same interface name. <strong>Delete</strong> removes a
+    device without merging.
 </p>
 
 {% if not duplicates %}

@@ -2,6 +2,8 @@ import logging
 from collections import defaultdict
 
 from django.contrib import messages
+from django.contrib.contenttypes.models import ContentType
+from django.db import transaction
 from django.core.paginator import Paginator
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect, render
@@ -17,6 +19,12 @@ from .forms import (
     DiscoveryTargetForm,
 )
 from .models import DiscoveryRun, DiscoveryTarget
+from .sync.netbox_sync import (
+    _add_journal_entry,
+    _describe_termination,
+    _get_cable_endpoints,
+    _set_cable_endpoints,
+)
 from .tables import DiscoveryRunTable, DiscoveryTargetTable
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
@@ -92,69 +100,23 @@ class MergeDevicesView(View):
             settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get("holding_site_name", "Holding")
         )
 
-        changed = False
+        try:
+            with transaction.atomic():
+                _merge_device_metadata(keeper, duplicate, holding_site_name)
+                _merge_device_interfaces(keeper, duplicate)
+                _rehome_duplicate_virtual_chassis(keeper, duplicate)
+                _adopt_duplicate_primary_ip(keeper, duplicate)
 
-        # Site: prefer whichever device has a real (non-holding) site.
-        # A manually-assigned site is always considered authoritative.
-        keeper_on_holding = not keeper.site or keeper.site.name == holding_site_name
-        dup_has_real_site = duplicate.site and duplicate.site.name != holding_site_name
-        if keeper_on_holding and dup_has_real_site:
-            keeper.site = duplicate.site
-            changed = True
+                dup_name = duplicate.name
+                duplicate.delete()
+        except ValueError as exc:
+            messages.error(request, str(exc))
+            return redirect("plugins:netbox_discovery:duplicate_devices")
 
-        # Serial: copy if keeper has none
-        if not keeper.serial and duplicate.serial:
-            keeper.serial = duplicate.serial
-            changed = True
-
-        # os_version custom field
-        dup_cf = duplicate.custom_field_data or {}
-        keep_cf = dict(keeper.custom_field_data or {})
-        if not keep_cf.get("os_version") and dup_cf.get("os_version"):
-            keep_cf["os_version"] = dup_cf["os_version"]
-            keeper.custom_field_data = keep_cf
-            changed = True
-
-        # Virtual Chassis: if duplicate is in a VC and keeper is not, transfer membership.
-        dup_vc = duplicate.virtual_chassis
-        if dup_vc and not keeper.virtual_chassis:
-            keeper.virtual_chassis = dup_vc
-            keeper.vc_position = duplicate.vc_position
-            keeper.vc_priority = duplicate.vc_priority
-            changed = True
-
-        if changed:
-            keeper.save()
-
-        # Resolve the VC the duplicate currently belongs to (re-fetch to avoid stale cache).
-        # This must happen regardless of whether we transferred the VC above.
-        dup_vc_fresh = (
-            duplicate.virtual_chassis.__class__.objects.filter(pk=duplicate.virtual_chassis_id).first()
-            if duplicate.virtual_chassis_id
-            else None
+        _add_journal_entry(
+            keeper,
+            f"Discovery duplicate merge: absorbed device '{dup_name}' and preserved its interface/IP/connection state where possible.",
         )
-        if dup_vc_fresh:
-            # If duplicate is currently the VC master, reassign master before we delete it.
-            if dup_vc_fresh.master_id == duplicate.pk:
-                # Prefer the keeper (now a VC member) or fall back to any other member.
-                new_master = (
-                    keeper
-                    if keeper.virtual_chassis_id == dup_vc_fresh.pk
-                    else Device.objects.filter(virtual_chassis=dup_vc_fresh)
-                         .exclude(pk=duplicate.pk)
-                         .first()
-                )
-                dup_vc_fresh.master = new_master
-                dup_vc_fresh.save()
-
-            # Detach duplicate from VC before deletion to avoid FK constraint errors.
-            duplicate.virtual_chassis = None
-            duplicate.vc_position = None
-            duplicate.vc_priority = None
-            duplicate.save()
-
-        dup_name = duplicate.name
-        duplicate.delete()
         messages.success(
             request,
             f"Merged '{dup_name}' into '{keeper.name}' and deleted the duplicate.",
@@ -173,6 +135,184 @@ class DeleteDuplicateDeviceView(View):
         device.delete()
         messages.success(request, f"Device '{name}' deleted.")
         return redirect("plugins:netbox_discovery:duplicate_devices")
+
+
+def _merge_device_metadata(keeper, duplicate, holding_site_name: str) -> None:
+    changed = False
+
+    keeper_on_holding = not keeper.site or keeper.site.name == holding_site_name
+    dup_has_real_site = duplicate.site and duplicate.site.name != holding_site_name
+    if keeper_on_holding and dup_has_real_site:
+        keeper.site = duplicate.site
+        changed = True
+
+    if not keeper.serial and duplicate.serial:
+        keeper.serial = duplicate.serial
+        changed = True
+
+    dup_cf = duplicate.custom_field_data or {}
+    keep_cf = dict(keeper.custom_field_data or {})
+    if not keep_cf.get("os_version") and dup_cf.get("os_version"):
+        keep_cf["os_version"] = dup_cf["os_version"]
+        keeper.custom_field_data = keep_cf
+        changed = True
+
+    dup_vc = duplicate.virtual_chassis
+    if dup_vc and not keeper.virtual_chassis:
+        keeper.virtual_chassis = dup_vc
+        keeper.vc_position = duplicate.vc_position
+        keeper.vc_priority = duplicate.vc_priority
+        changed = True
+
+    if changed:
+        keeper.save()
+
+
+def _merge_device_interfaces(keeper, duplicate) -> None:
+    from dcim.models import Interface
+
+    iface_ct = ContentType.objects.get_for_model(Interface)
+    keeper_interfaces = {
+        iface.name.lower(): iface
+        for iface in Interface.objects.filter(device=keeper).select_related("lag", "device")
+    }
+    duplicate_interfaces = list(
+        Interface.objects.filter(device=duplicate).select_related("lag", "device")
+    )
+    interface_map = {}
+
+    for dup_iface in duplicate_interfaces:
+        keeper_iface = keeper_interfaces.get(dup_iface.name.lower())
+        if keeper_iface is None:
+            dup_iface.device = keeper
+            dup_iface.save()
+            keeper_iface = dup_iface
+            keeper_interfaces[keeper_iface.name.lower()] = keeper_iface
+            interface_map[dup_iface.pk] = keeper_iface
+            continue
+
+        if dup_iface.cable_id and keeper_iface.cable_id and dup_iface.cable_id != keeper_iface.cable_id:
+            dup_a, dup_b = _get_cable_endpoints(dup_iface.cable)
+            keep_a, keep_b = _get_cable_endpoints(keeper_iface.cable)
+            dup_other = dup_b if dup_a and dup_a.pk == dup_iface.pk else dup_a
+            keep_other = keep_b if keep_a and keep_a.pk == keeper_iface.pk else keep_a
+            if getattr(dup_other, "pk", None) != getattr(keep_other, "pk", None):
+                raise ValueError(
+                    f"Cannot merge '{duplicate.name}' into '{keeper.name}' automatically: "
+                    f"interface '{dup_iface.name}' is connected to both "
+                    f"{_describe_termination(dup_other)} and {_describe_termination(keep_other)}. "
+                    "Please resolve the connection conflict first."
+                )
+
+        _merge_interface_attributes(keeper_iface, dup_iface)
+        _move_interface_ips(dup_iface, keeper_iface, iface_ct)
+        _move_interface_cable(dup_iface, keeper_iface)
+        interface_map[dup_iface.pk] = keeper_iface
+
+    for old_iface_id, new_iface in interface_map.items():
+        old_iface = next((iface for iface in duplicate_interfaces if iface.pk == old_iface_id), None)
+        old_lag = getattr(old_iface, "lag", None)
+        if old_lag is None:
+            continue
+        mapped_lag = interface_map.get(old_lag.pk)
+        if mapped_lag and getattr(new_iface, "lag_id", None) != mapped_lag.pk:
+            new_iface.lag = mapped_lag
+            new_iface.save()
+
+def _merge_interface_attributes(target_iface, source_iface) -> None:
+    changed = False
+
+    if not getattr(target_iface, "description", "") and getattr(source_iface, "description", ""):
+        target_iface.description = source_iface.description
+        changed = True
+    if not getattr(target_iface, "mtu", None) and getattr(source_iface, "mtu", None):
+        target_iface.mtu = source_iface.mtu
+        changed = True
+    if not getattr(target_iface, "mac_address", None) and getattr(source_iface, "mac_address", None):
+        target_iface.mac_address = source_iface.mac_address
+        changed = True
+    if not getattr(target_iface, "enabled", True) and getattr(source_iface, "enabled", True):
+        target_iface.enabled = source_iface.enabled
+        changed = True
+    if changed:
+        target_iface.save()
+
+
+def _move_interface_ips(source_iface, target_iface, iface_ct) -> None:
+    from ipam.models import IPAddress
+
+    for ip_obj in IPAddress.objects.filter(
+        assigned_object_type=iface_ct,
+        assigned_object_id=source_iface.pk,
+    ):
+        ip_obj.assigned_object_type = iface_ct
+        ip_obj.assigned_object_id = target_iface.pk
+        ip_obj.save()
+
+
+def _move_interface_cable(source_iface, target_iface) -> None:
+    cable = getattr(source_iface, "cable", None)
+    if cable is None or getattr(target_iface, "cable_id", None) == getattr(source_iface, "cable_id", None):
+        return
+    if getattr(target_iface, "cable_id", None):
+        return
+
+    a_term, b_term = _get_cable_endpoints(cable)
+    if a_term is None or b_term is None:
+        return
+
+    if a_term.pk == source_iface.pk:
+        _set_cable_endpoints(cable, target_iface, b_term)
+        moved_peer = b_term
+    elif b_term.pk == source_iface.pk:
+        _set_cable_endpoints(cable, a_term, target_iface)
+        moved_peer = a_term
+    else:
+        return
+
+    _add_journal_entry(
+        cable,
+        (
+            "Discovery duplicate merge preserved a connection by moving one cable endpoint "
+            f"from {_describe_termination(source_iface)} to {_describe_termination(target_iface)} "
+            f"while keeping {_describe_termination(moved_peer)} connected."
+        ),
+    )
+
+
+def _rehome_duplicate_virtual_chassis(keeper, duplicate) -> None:
+    from dcim.models import Device
+
+    dup_vc_fresh = (
+        duplicate.virtual_chassis.__class__.objects.filter(pk=duplicate.virtual_chassis_id).first()
+        if duplicate.virtual_chassis_id
+        else None
+    )
+    if not dup_vc_fresh:
+        return
+
+    if dup_vc_fresh.master_id == duplicate.pk:
+        new_master = (
+            keeper
+            if keeper.virtual_chassis_id == dup_vc_fresh.pk
+            else Device.objects.filter(virtual_chassis=dup_vc_fresh)
+            .exclude(pk=duplicate.pk)
+            .first()
+        )
+        dup_vc_fresh.master = new_master
+        dup_vc_fresh.save()
+
+    duplicate.virtual_chassis = None
+    duplicate.vc_position = None
+    duplicate.vc_priority = None
+    duplicate.save()
+
+
+def _adopt_duplicate_primary_ip(keeper, duplicate) -> None:
+    duplicate_primary = getattr(duplicate, "primary_ip4", None)
+    if duplicate_primary and keeper.primary_ip4_id is None:
+        keeper.primary_ip4 = duplicate_primary
+        keeper.save()
 
 
 # ---------------------------------------------------------------------------

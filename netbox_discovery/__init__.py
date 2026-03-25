@@ -5,7 +5,7 @@ class DiscoveryConfig(PluginConfig):
     name = "netbox_discovery"
     verbose_name = "Network Discovery"
     description = "Discovers network devices via CDP/LLDP and NAPALM, syncing facts into NetBox"
-    version = "1.0.0"
+    version = "1.1.0"
     author = "NetBox Discovery Contributors"
     author_email = "noreply@example.com"
     base_url = "discovery"
