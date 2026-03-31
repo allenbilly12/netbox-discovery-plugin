@@ -32,6 +32,14 @@ run(data)
 
 All shared state (`log_lines`, `counters`, `device_results`, `neighbor_records`) is protected by `log_lock` (a `threading.Lock`). The `log_fn` closure acquires the lock, appends the line, and flushes the run log to the DB via `queryset.update()`.
 
+### Discovery Run Log File
+
+Verbose per-device discovery output is written to a dedicated rotating file:
+
+- `/var/log/netbox/discovery_runs.log` (20 MB x 10 files)
+
+This logger does **not** propagate to the main `netbox.log`, so discovery crawl chatter is isolated. If the file cannot be opened, jobs fall back to the main plugin logger.
+
 ### Callbacks passed to crawl()
 
 - `on_device(ip, device_data, driver_name)` — called on success; calls `sync_device()`, appends to `device_results` and `neighbor_records`

@@ -7,6 +7,8 @@ discovery_scheduler: system_job that fires every N minutes and enqueues
 """
 
 import logging
+import logging.handlers
+import os
 import threading
 
 from django.conf import settings
@@ -18,6 +20,45 @@ logger = logging.getLogger("netbox.plugins.netbox_discovery")
 
 # 1 hour — large enough for any realistic crawl
 JOB_TIMEOUT = 3600
+
+
+def _get_discovery_run_logger() -> logging.Logger:
+    """
+    Dedicated logger for verbose discovery run output.
+
+    Writes to /var/log/netbox/discovery_runs.log so per-device crawl logs do
+    not clutter the main netbox.log stream.
+    """
+    name = "netbox.plugins.netbox_discovery.runs"
+    run_logger = logging.getLogger(name)
+    if run_logger.handlers:
+        return run_logger
+
+    run_logger.setLevel(logging.INFO)
+    run_logger.propagate = False
+
+    log_path = "/var/log/netbox/discovery_runs.log"
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            log_path,
+            maxBytes=20 * 1024 * 1024,  # 20 MB per file
+            backupCount=10,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        run_logger.addHandler(handler)
+    except OSError as exc:
+        # Fall back to main plugin logger if dedicated file cannot be opened.
+        logger.warning(
+            "Cannot open discovery run log %s: %s — using main logger fallback",
+            log_path,
+            exc,
+        )
+        run_logger.addHandler(logging.NullHandler())
+        run_logger.propagate = True
+
+    return run_logger
 
 
 class DiscoveryJob(JobRunner):
@@ -75,12 +116,13 @@ class DiscoveryJob(JobRunner):
         neighbor_records = []  # [{hostname, neighbors}] — for post-crawl cable sync
         log_lock = threading.Lock()  # guards log_lines, counters, device_results, neighbor_records
         final_status = "failed"
+        run_logger = _get_discovery_run_logger()
 
         def log_fn(msg):
             with log_lock:
                 log_lines.append(msg)
                 snapshot = "\n".join(log_lines)
-            logger.info("[Discovery:%s] %s", target.name, msg)
+            run_logger.info("[Discovery:%s] %s", target.name, msg)
             self._safe_log(msg)
             # Flush every line to DB so the UI always shows the latest output
             try:
@@ -96,7 +138,7 @@ class DiscoveryJob(JobRunner):
             with log_lock:
                 log_lines.extend(messages)
                 snapshot = "\n".join(log_lines)
-            logger.info("[Discovery:%s]\n%s", target.name, block)
+            run_logger.info("[Discovery:%s]\n%s", target.name, block)
             self._safe_log(block)
             # Single DB write for the whole block
             try:
