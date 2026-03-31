@@ -747,9 +747,10 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
     deleted_names: List[str] = []
     delete_failed = 0
     prune_skipped = False
-    desired_ifaces = set(interfaces_raw.keys())
+    normalized_raw = _normalize_interfaces_payload(interfaces_raw)
+    desired_ifaces = set(normalized_raw.keys())
 
-    for iface_name, iface_data in interfaces_raw.items():
+    for iface_name, iface_data in normalized_raw.items():
         iface_type = map_interface_type(iface_name)
         iface, created = Interface.objects.get_or_create(
             device=device,
@@ -897,8 +898,10 @@ def _sync_lag_members(device, lag_members: Dict[str, List[str]], log_fn: Callabl
 
     managed_lags = {}
     desired_members_by_lag_id: Dict[int, set] = {}
+    unresolved_members: List[str] = []
 
     for lag_name, member_names in lag_members.items():
+        lag_name = _canonical_interface_name(lag_name)
         lag_iface = _find_interface(device, lag_name)
         if lag_iface is None:
             lag_iface, _ = Interface.objects.get_or_create(
@@ -914,13 +917,15 @@ def _sync_lag_members(device, lag_members: Dict[str, List[str]], log_fn: Callabl
         desired_member_names = set()
 
         for member_name in member_names:
+            member_name = _canonical_interface_name(member_name)
             member_iface = _find_interface(device, member_name)
             if member_iface is None:
-                member_iface, _ = Interface.objects.get_or_create(
-                    device=device,
-                    name=member_name,
-                    defaults={"type": map_interface_type(member_name)},
+                unresolved_members.append(member_name)
+                log_fn(
+                    f"  [WARN] LAG member '{member_name}' on {device.name} was not found in "
+                    "discovered interfaces; skipping assignment to avoid duplicate interface creation."
                 )
+                continue
             desired_member_names.add(member_iface.name)
 
             current_lag = getattr(member_iface, "lag", None)
@@ -961,6 +966,15 @@ def _sync_lag_members(device, lag_members: Dict[str, List[str]], log_fn: Callabl
             ),
         )
 
+    if unresolved_members:
+        unique_missing = sorted(set(unresolved_members))
+        _add_journal_entry(
+            device,
+            "Discovery skipped unresolved LAG members to avoid duplicate interface creation: "
+            + ", ".join(unique_missing)
+            + ".",
+        )
+
 
 def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
     from dcim.models import Interface
@@ -977,6 +991,7 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
     }
 
     for iface_name, addr_families in interfaces_ip.items():
+        iface_name = _canonical_interface_name(iface_name)
         # Resolve the interface object
         iface = Interface.objects.filter(device=device, name=iface_name).first()
         if not iface:
@@ -1366,18 +1381,111 @@ def _find_interface(device, name: str):
     if not name:
         return None
 
-    iface = Interface.objects.filter(device=device, name__iexact=name).first()
+    canonical_name = _canonical_interface_name(name)
+    iface = Interface.objects.filter(device=device, name__iexact=canonical_name).first()
     if iface:
         return iface
 
-    lower = name.lower()
+    lower = canonical_name.lower()
     for abbrev, full in _IFACE_EXPANSIONS:
         if lower.startswith(abbrev) and not lower.startswith(full):
             expanded = full + lower[len(abbrev):]
             iface = Interface.objects.filter(device=device, name__iexact=expanded).first()
             if iface:
                 return iface
+
+    # Final fallback: canonicalized prefix matching so abbreviated and fully
+    # expanded names resolve to the same interface key.
+    wanted_key = _interface_name_key(name)
+    if wanted_key:
+        for candidate_name, candidate_pk in Interface.objects.filter(device=device).values_list("name", "pk"):
+            if _interface_name_key(candidate_name) == wanted_key:
+                return Interface.objects.filter(pk=candidate_pk).first()
     return None
+
+
+def _interface_name_key(name: str) -> str:
+    """Normalize interface names for loose abbreviation/full-name matching."""
+    if not name:
+        return ""
+    return _canonical_interface_name(name).lower().replace(" ", "")
+
+
+def _canonical_interface_name(name: str) -> str:
+    """Return a standardized (expanded) interface name."""
+    if not name:
+        return ""
+
+    raw = str(name).strip()
+    if not raw:
+        return ""
+
+    match = re.match(r"^([A-Za-z-]+)(.*)$", raw)
+    if not match:
+        return raw
+
+    prefix = match.group(1).lower()
+    suffix = match.group(2)
+
+    canonical_prefix = {
+        "eth": "Ethernet",
+        "et": "Ethernet",
+        "gi": "GigabitEthernet",
+        "ge": "GigabitEthernet",
+        "gigabit": "GigabitEthernet",
+        "gigabitethernet": "GigabitEthernet",
+        "fa": "FastEthernet",
+        "fe": "FastEthernet",
+        "fasteth": "FastEthernet",
+        "fastethernet": "FastEthernet",
+        "te": "TenGigabitEthernet",
+        "tengig": "TenGigabitEthernet",
+        "tengige": "TenGigabitEthernet",
+        "tengigabitethernet": "TenGigabitEthernet",
+        "fo": "FortyGigabitEthernet",
+        "fortygige": "FortyGigabitEthernet",
+        "fortygigabitethernet": "FortyGigabitEthernet",
+        "hu": "HundredGigabitEthernet",
+        "hundredgige": "HundredGigabitEthernet",
+        "hundredgigabitethernet": "HundredGigabitEthernet",
+        "twe": "TwentyFiveGigE",
+        "twentyfivege": "TwentyFiveGigE",
+        "twentyfivegigabitethernet": "TwentyFiveGigE",
+        "po": "Port-Channel",
+        "port-channel": "Port-Channel",
+        "ae": "Port-Channel",
+        "lo": "Loopback",
+        "loopback": "Loopback",
+        "mg": "Management",
+        "ma": "Management",
+        "mgmt": "Management",
+        "management": "Management",
+        "vlan": "Vlan",
+    }.get(prefix)
+
+    return f"{canonical_prefix}{suffix}" if canonical_prefix else raw
+
+
+def _normalize_interfaces_payload(interfaces_raw: Dict) -> Dict:
+    """
+    Canonicalize interface names and merge duplicate entries that normalize to
+    the same key (for example Eth1/3 and Ethernet1/3).
+    """
+    normalized: Dict[str, Dict] = {}
+    for raw_name, iface_data in (interfaces_raw or {}).items():
+        canonical_name = _canonical_interface_name(raw_name)
+        if not canonical_name:
+            continue
+        existing = normalized.get(canonical_name)
+        if existing is None:
+            normalized[canonical_name] = dict(iface_data or {})
+            continue
+        incoming = iface_data or {}
+        # Prefer the most informative non-empty value for each field.
+        for key, value in incoming.items():
+            if value not in (None, "", []):
+                existing[key] = value
+    return normalized
 
 
 def _describe_termination(term) -> str:

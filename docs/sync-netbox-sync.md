@@ -20,6 +20,8 @@ Main entry point. Called once per device from `jobs.py`'s `on_device` callback.
 6. **Hostname-to-site matching** — `_match_site_by_hostname()`: if device is on holding site, try to find a real site whose name is a prefix of the hostname (e.g. `GBLON10SWI01` → site `GBLON10`).
 7. **Auto-tagging** — `_sync_device_tags()` applies classification-derived tags (vendor, device type, series) to the device. Tags are additive — never removed.
 8. **Interfaces** — `_sync_interfaces()`: `get_or_create` each interface, update enabled/description/MTU/MAC, and prune stale interfaces after detaching cable/IP/LAG dependencies. Pruning is skipped when collector `get_interfaces()` failed for that device.
+   - Interface names are canonicalized to expanded forms (for example `Eth1/3` → `Ethernet1/3`) before sync.
+   - Short-name duplicates are treated as stale and removed during successful reconciliation.
 9. **IP Addresses** — `_sync_ips()`: `get_or_create` each IP, assign to interface. Returns management IP object.
 10. **Primary IP** — set `device.primary_ip4`. If conflict detected:
    - Preserve existing `primary_ip4` if it still exists on the device (do not overwrite with newly discovered candidate IPs).
@@ -62,7 +64,9 @@ Example: `GBLON10SWI01` → site `GBLON10`
 Exact name match → domain-variant match (same `_base_hostname()`).
 
 ### _find_interface(device, name)
-Exact match first, then expands abbreviations from `_IFACE_EXPANSIONS` list (sorted longest-first to avoid prefix collisions: `"twe"` before `"te"`).
+Exact match first, then expands abbreviations from `_IFACE_EXPANSIONS` list (sorted longest-first to avoid prefix collisions: `"twe"` before `"te"`), then falls back to canonicalized abbreviation/full-name key matching.
+
+LAG member sync intentionally skips unresolved member names instead of auto-creating placeholder interfaces, to avoid duplicate interface rows.
 
 ### _get_or_create_device(hostname, mgmt_ip, site, ...)
 1. Exact hostname match
