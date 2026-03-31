@@ -184,6 +184,9 @@ def crawl(
                 collect_duration: Optional[float] = None
                 sync_duration: Optional[float] = None
                 device_status = "unknown"
+                step_status_summary = (
+                    "facts=n/a interfaces=n/a lag=n/a ips=n/a vlans=n/a neighbors=n/a stack=n/a"
+                )
 
                 def device_log(msg, _buf=device_lines):
                     """
@@ -280,6 +283,16 @@ def crawl(
                         facts = data.get("facts", {})
                         hostname = facts.get("hostname", ip)
                         discovered_hostname = hostname
+                        step_status = data.get("step_status", {}) or {}
+                        step_status_summary = (
+                            f"facts={step_status.get('facts', 'n/a')} "
+                            f"interfaces={step_status.get('interfaces', 'n/a')} "
+                            f"lag={step_status.get('lag', 'n/a')} "
+                            f"ips={step_status.get('interfaces_ip', 'n/a')} "
+                            f"vlans={step_status.get('vlans', 'n/a')} "
+                            f"neighbors={step_status.get('neighbors', 'n/a')} "
+                            f"stack={step_status.get('stack', 'n/a')}"
+                        )
                         device_log(
                             f"  Hostname: {hostname} | Vendor: {facts.get('vendor', '?')} "
                             f"| Model: {facts.get('model', '?')} | Serial: {facts.get('serial_number', '?')}"
@@ -357,6 +370,7 @@ def crawl(
                         "[SUMMARY] "
                         f"status={device_status} "
                         f"driver={selected_driver or 'n/a'} "
+                        f"{step_status_summary} "
                         f"queued={queued_neighbors_count} "
                         f"warnings={warning_count} "
                         f"errors={error_count} "

@@ -19,6 +19,7 @@ Returns a dict with keys:
 | `neighbors` | list | LLDP detail → LLDP basic → CDP CLI (in order) |
 | `stack_members` | list | `_detect_cisco_stack()` (IOS only) |
 | `raw_errors` | list | Any collection warnings/errors |
+| `step_status` | dict | Per-step status map (`ok`/`fail`/`skip`) |
 
 ### Collection Steps
 

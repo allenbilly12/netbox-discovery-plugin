@@ -50,7 +50,7 @@ Uses a `queue.Queue` (work queue) and a `threading.Lock` (guards `visited` set a
 - Poison-pill shutdown: after `work_queue.join()` (all items processed), one `None` sentinel is enqueued per worker thread to unblock their `queue.get()` call.
 - Each worker closes its Django DB connection in a `finally` block so connections are returned to the pool.
 - Per-device output is buffered and flushed atomically as a block. Every physical line is prefixed with device context (`[ip d=depth]`, then `[hostname]` once discovered), so multiline exceptions remain attributable to the correct device.
-- Each device block ends with a compact `[SUMMARY]` line containing status, selected driver, warnings/errors, neighbors queued, and timing metrics (connect/collect/sync/total) for quick triage.
+- Each device block ends with a compact `[SUMMARY]` line containing status, selected driver, step outcomes (`facts/interfaces/lag/ips/vlans/neighbors/stack`), warnings/errors, neighbors queued, and timing metrics (connect/collect/sync/total) for quick triage.
 
 ---
 

@@ -49,6 +49,15 @@ def collect_device_data(
         "neighbors": [],
         "stack_members": [],
         "raw_errors": [],
+        "step_status": {
+            "facts": "pending",
+            "interfaces": "pending",
+            "lag": "pending",
+            "interfaces_ip": "pending",
+            "vlans": "pending",
+            "neighbors": "pending",
+            "stack": "pending",
+        },
     }
 
     STEPS = 7  # facts, interfaces, LAG, IPs, VLANs, neighbors, stack
@@ -58,8 +67,10 @@ def collect_device_data(
     t0 = time.monotonic()
     try:
         result["facts"] = device.get_facts()
+        result["step_status"]["facts"] = "ok"
         log_fn(f"    [1/{STEPS}] get_facts() done ({time.monotonic()-t0:.1f}s) — hostname={result['facts'].get('hostname', '?')}")
     except Exception as exc:
+        result["step_status"]["facts"] = "fail"
         msg = f"get_facts() failed ({time.monotonic()-t0:.1f}s): {exc}"
         log_fn(f"    [WARN] {msg}")
         logger.warning(msg)
@@ -70,8 +81,10 @@ def collect_device_data(
     t0 = time.monotonic()
     try:
         result["interfaces"] = device.get_interfaces()
+        result["step_status"]["interfaces"] = "ok"
         log_fn(f"    [2/{STEPS}] get_interfaces() done ({time.monotonic()-t0:.1f}s) — {len(result['interfaces'])} interfaces")
     except Exception as exc:
+        result["step_status"]["interfaces"] = "fail"
         msg = f"get_interfaces() failed ({time.monotonic()-t0:.1f}s): {exc}"
         log_fn(f"    [WARN] {msg}")
         logger.warning(msg)
@@ -82,6 +95,7 @@ def collect_device_data(
     t0 = time.monotonic()
     try:
         result["lag_members"] = _collect_lag_members(device, driver_name)
+        result["step_status"]["lag"] = "ok"
         lag_count = len(result["lag_members"])
         member_count = sum(len(members) for members in result["lag_members"].values())
         if lag_count:
@@ -92,6 +106,7 @@ def collect_device_data(
         else:
             log_fn(f"    [3/{STEPS}] LAG member discovery done ({time.monotonic()-t0:.1f}s) — none found")
     except Exception as exc:
+        result["step_status"]["lag"] = "fail"
         msg = f"LAG member discovery failed ({time.monotonic()-t0:.1f}s): {exc}"
         log_fn(f"    [WARN] {msg}")
         logger.warning(msg)
@@ -102,8 +117,10 @@ def collect_device_data(
     t0 = time.monotonic()
     try:
         result["interfaces_ip"] = device.get_interfaces_ip()
+        result["step_status"]["interfaces_ip"] = "ok"
         log_fn(f"    [4/{STEPS}] get_interfaces_ip() done ({time.monotonic()-t0:.1f}s) — {len(result['interfaces_ip'])} L3 interfaces")
     except Exception as exc:
+        result["step_status"]["interfaces_ip"] = "fail"
         msg = f"get_interfaces_ip() failed ({time.monotonic()-t0:.1f}s): {exc}"
         log_fn(f"    [WARN] {msg}")
         logger.warning(msg)
@@ -114,8 +131,10 @@ def collect_device_data(
     t0 = time.monotonic()
     try:
         result["vlans"] = device.get_vlans()
+        result["step_status"]["vlans"] = "ok"
         log_fn(f"    [5/{STEPS}] get_vlans() done ({time.monotonic()-t0:.1f}s) — {len(result['vlans'])} VLANs")
     except Exception as exc:
+        result["step_status"]["vlans"] = "skip"
         # Many drivers don't support get_vlans(); treat as non-fatal
         log_fn(f"    [5/{STEPS}] get_vlans() not supported ({time.monotonic()-t0:.1f}s) — skipped")
         logger.debug("get_vlans() not supported or failed: %s", exc)
@@ -124,6 +143,8 @@ def collect_device_data(
     log_fn(f"    [6/{STEPS}] neighbor discovery (protocol={discovery_protocol})...")
     t0 = time.monotonic()
     neighbors = []
+    lldp_success = discovery_protocol not in ("lldp", "both")
+    cdp_success = discovery_protocol not in ("cdp", "both")
     if discovery_protocol in ("lldp", "both"):
         try:
             lldp_detail = device.get_lldp_neighbors_detail()
@@ -139,6 +160,7 @@ def collect_device_data(
                             "remote_description": n.get("remote_system_description", ""),
                         }
                     )
+            lldp_success = True
             log_fn(f"    [6/{STEPS}] LLDP detail: {len(neighbors)} neighbors ({time.monotonic()-t0:.1f}s)")
         except Exception as exc:
             logger.debug("get_lldp_neighbors_detail() failed: %s", exc)
@@ -157,6 +179,7 @@ def collect_device_data(
                                 "remote_description": "",
                             }
                         )
+                lldp_success = True
                 log_fn(f"    [6/{STEPS}] LLDP basic: {len(neighbors)} neighbors ({time.monotonic()-t0:.1f}s)")
             except Exception as exc2:
                 log_fn(f"    [6/{STEPS}] LLDP not available ({time.monotonic()-t0:.1f}s)")
@@ -169,6 +192,7 @@ def collect_device_data(
         try:
             cdp_data = _get_cdp_via_cli(device, driver_name)
             neighbors.extend(cdp_data)
+            cdp_success = True
             log_fn(f"    [6/{STEPS}] CDP: {len(cdp_data)} neighbors ({time.monotonic()-cdp_t0:.1f}s)")
         except Exception as exc:
             log_fn(f"    [6/{STEPS}] CDP failed ({time.monotonic()-cdp_t0:.1f}s): {exc}")
@@ -196,10 +220,15 @@ def collect_device_data(
 
     log_fn(f"    [6/{STEPS}] neighbor discovery done — {len(neighbors)} total neighbors ({time.monotonic()-t0:.1f}s)")
     result["neighbors"] = neighbors
+    result["step_status"]["neighbors"] = "ok" if (lldp_success and cdp_success) else "fail"
 
     # --- Cisco Stack detection (IOS only) ---
     log_fn(f"    [7/{STEPS}] Checking for Cisco StackWise members...")
     t0 = time.monotonic()
+    if driver_name not in ("ios",):
+        result["step_status"]["stack"] = "skip"
+    else:
+        result["step_status"]["stack"] = "ok"
     stack_members = _detect_cisco_stack(device, driver_name, log_fn)
     if len(stack_members) > 1:
         log_fn(
