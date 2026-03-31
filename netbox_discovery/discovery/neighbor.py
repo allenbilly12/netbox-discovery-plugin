@@ -12,6 +12,7 @@ from the pool automatically.
 
 import logging
 import queue as _queue_mod
+import inspect
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -20,6 +21,44 @@ from .collector import collect_device_data
 from .driver_detect import detect_and_connect
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
+
+
+def _invoke_on_device_data(
+    callback: Callable[..., None],
+    ip: str,
+    data: Dict[str, Any],
+    driver_name: str,
+    device_log: Callable[[str], None],
+) -> None:
+    """Invoke on_device_data callback while supporting legacy 3-arg signatures."""
+    try:
+        sig = inspect.signature(callback)
+    except (TypeError, ValueError):
+        # Built-ins/partials may not have an inspectable signature; try 4 args first.
+        sig = None
+
+    if sig is not None:
+        positional = [
+            p
+            for p in sig.parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        has_varargs = any(p.kind == p.VAR_POSITIONAL for p in sig.parameters.values())
+        if not has_varargs and len(positional) <= 3:
+            callback(ip, data, driver_name)
+            return
+
+    try:
+        callback(ip, data, driver_name, device_log)
+    except TypeError as exc:
+        # Backward-compatibility fallback: older callbacks accept 3 args only.
+        if "positional argument" in str(exc) and (
+            "4 were given" in str(exc)
+            or "required positional argument" in str(exc)
+        ):
+            callback(ip, data, driver_name)
+            return
+        raise
 
 
 def crawl(
@@ -216,7 +255,9 @@ def crawl(
                         # NetBox sync — pass buffered log so sync output stays grouped
                         if on_device_data:
                             try:
-                                on_device_data(ip, data, driver_name, device_log)
+                                _invoke_on_device_data(
+                                    on_device_data, ip, data, driver_name, device_log
+                                )
                             except Exception as exc:
                                 device_log(f"  [ERROR] NetBox sync failed for {ip}: {exc} — continuing")
                                 logger.exception("Sync error for %s", ip)
