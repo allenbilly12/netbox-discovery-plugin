@@ -587,11 +587,33 @@ def _next_available_device_name(base_name: str) -> str:
 
 
 def _perform_hardware_refresh(old_device, hostname: str, new_device_type, role, serial: str, log_fn: Callable):
-    from dcim.models import Device
+    from dcim.models import Device, Interface
+    from ipam.models import IPAddress
+    from django.contrib.contenttypes.models import ContentType
 
     old_model = old_device.device_type.model if old_device.device_type_id else "Unknown"
     new_model = new_device_type.model
     old_serial = old_device.serial or "N/A"
+
+    # Clear IP ownership from interfaces on the old device so the replacement can
+    # safely claim the same addresses during sync (notably management/primary IP).
+    iface_ids = list(
+        Interface.objects.filter(device=old_device).values_list("pk", flat=True)
+    )
+    released_ip_count = 0
+    if iface_ids:
+        iface_ct = ContentType.objects.get_for_model(Interface)
+        ips_to_release = IPAddress.objects.filter(
+            assigned_object_type=iface_ct,
+            assigned_object_id__in=iface_ids,
+        )
+        released_ip_count = ips_to_release.count()
+        ips_to_release.update(assigned_object_type=None, assigned_object_id=None)
+
+    if old_device.primary_ip4_id or getattr(old_device, "primary_ip6_id", None):
+        old_device.primary_ip4 = None
+        if hasattr(old_device, "primary_ip6"):
+            old_device.primary_ip6 = None
 
     archive_name = _next_available_device_name(old_device.name)
     old_device_name = old_device.name
@@ -623,7 +645,8 @@ def _perform_hardware_refresh(old_device, hostname: str, new_device_type, role, 
     _add_journal_entry(replacement, refresh_note)
     log_fn(
         f"  [Refresh] {old_model}/{old_serial} replaced by {new_model}/{serial}. "
-        f"Archived '{old_device_name}' as '{archive_name}' (status={old_device.status})."
+        f"Archived '{old_device_name}' as '{archive_name}' (status={old_device.status}, "
+        f"released_ips={released_ip_count})."
     )
     return replacement
 
