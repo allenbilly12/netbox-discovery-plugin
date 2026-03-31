@@ -2,6 +2,7 @@ import logging
 from collections import defaultdict
 
 from django.contrib import messages
+from django.contrib.auth.mixins import LoginRequiredMixin, PermissionRequiredMixin
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from django.core.paginator import Paginator
@@ -40,29 +41,42 @@ def _base_name(device_name: str) -> str:
     return device_name.split(".")[0].lower() if device_name else ""
 
 
-class DuplicateDevicesView(View):
+class DuplicateDevicesView(LoginRequiredMixin, PermissionRequiredMixin, View):
     """
     Lists NetBox devices that share the same base hostname but have different
     full names (e.g. router1.emea.bcd.local vs router1.us.bcd.local).
     """
 
+    permission_required = "dcim.view_device"
     template_name = "netbox_discovery/duplicate_devices.html"
 
     def get(self, request):
         from dcim.models import Device
 
+        # Step 1: fetch only (pk, name) — minimal memory footprint.
+        # Avoids loading full Device objects for every device in NetBox.
+        name_data = Device.objects.values_list("pk", "name").order_by("name")
         groups: dict = defaultdict(list)
-        for device in Device.objects.select_related(
-            "site", "device_type__manufacturer", "role"
-        ).order_by("name"):
-            key = _base_name(device.name)
+        for pk, name in name_data:
+            key = _base_name(name)
             if key:
-                groups[key].append(device)
+                groups[key].append(pk)
+
+        # Step 2: identify groups that have more than one device
+        dup_groups = {base: pks for base, pks in groups.items() if len(pks) > 1}
+
+        # Step 3: fetch full objects only for the duplicate devices
+        all_dup_pks = [pk for pks in dup_groups.values() for pk in pks]
+        device_map = {
+            d.pk: d
+            for d in Device.objects.filter(pk__in=all_dup_pks).select_related(
+                "site", "device_type__manufacturer", "role"
+            )
+        }
 
         duplicates = [
-            {"base": base, "devices": devs}
-            for base, devs in sorted(groups.items())
-            if len(devs) > 1
+            {"base": base, "devices": [device_map[pk] for pk in pks if pk in device_map]}
+            for base, pks in sorted(dup_groups.items())
         ]
 
         paginator = Paginator(duplicates, 25)
@@ -77,10 +91,12 @@ class DuplicateDevicesView(View):
         })
 
 
-class MergeDevicesView(View):
+class MergeDevicesView(LoginRequiredMixin, PermissionRequiredMixin, View):
     """
     POST: keep one device, copy missing data from the duplicate, then delete it.
     """
+
+    permission_required = ("dcim.change_device", "dcim.delete_device")
 
     def post(self, request):
         from dcim.models import Device
@@ -124,8 +140,10 @@ class MergeDevicesView(View):
         return redirect("plugins:netbox_discovery:duplicate_devices")
 
 
-class DeleteDuplicateDeviceView(View):
+class DeleteDuplicateDeviceView(LoginRequiredMixin, PermissionRequiredMixin, View):
     """POST: delete a single device identified as a duplicate."""
+
+    permission_required = "dcim.delete_device"
 
     def post(self, request, pk):
         from dcim.models import Device

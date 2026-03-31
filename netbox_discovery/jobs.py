@@ -88,6 +88,22 @@ class DiscoveryJob(JobRunner):
             except Exception:
                 pass
 
+        def log_batch(messages):
+            """Flush multiple log lines atomically — keeps per-device output grouped."""
+            if not messages:
+                return
+            with log_lock:
+                log_lines.extend(messages)
+                snapshot = "\n".join(log_lines)
+            for msg in messages:
+                logger.info("[Discovery:%s] %s", target.name, msg)
+                self._safe_log(msg)
+            # Single DB write for the whole block
+            try:
+                run.__class__.objects.filter(pk=run.pk).update(log=snapshot)
+            except Exception:
+                pass
+
         try:
             log_fn(f"=== Discovery started: {target.name} ===")
             log_fn(f"Targets: {target.get_target_list()}")
@@ -107,14 +123,15 @@ class DiscoveryJob(JobRunner):
                 return
 
             # Step 2: BFS crawl + NetBox sync
-            def on_device(ip, device_data, driver_name):
+            def on_device(ip, device_data, driver_name, device_log_fn=None):
+                _log = device_log_fn or log_fn
                 try:
                     device_data["driver"] = driver_name
                     device_name, was_created = sync_device(
                         mgmt_ip=ip,
                         data=device_data,
                         holding_site_name=holding_site,
-                        log_fn=log_fn,
+                        log_fn=_log,
                     )
                     with log_lock:
                         status = "created" if was_created else "updated"
@@ -133,7 +150,7 @@ class DiscoveryJob(JobRunner):
                         else:
                             counters["devices_updated"] += 1
                 except Exception as exc:
-                    log_fn(f"  [ERROR] Sync failed for {ip}: {exc}")
+                    _log(f"  [ERROR] Sync failed for {ip}: {exc}")
                     logger.exception("sync_device error for %s", ip)
                     with log_lock:
                         device_results.append({
@@ -165,6 +182,7 @@ class DiscoveryJob(JobRunner):
                 on_device_data=on_device,
                 on_device_failed=on_device_failed,
                 log_fn=log_fn,
+                log_batch_fn=log_batch,
                 max_workers=target.max_workers,
             )
             counters["errors"] += crawl_summary.get("failed", 0)
@@ -303,7 +321,7 @@ try:
             name = "Discovery Scheduler"
 
         def run(self, **kwargs):
-            from .models import DiscoveryTarget
+            from .models import DiscoveryRun, DiscoveryTarget
 
             now = timezone.now()
             for target in DiscoveryTarget.objects.filter(enabled=True, scan_interval__gt=0):
@@ -313,13 +331,23 @@ try:
                     elapsed_minutes = (now - target.last_run).total_seconds() / 60
                     due = elapsed_minutes >= target.scan_interval
 
-                if due:
+                if not due:
+                    continue
+
+                # Don't enqueue a second job if one is already running for this target.
+                if DiscoveryRun.objects.filter(target=target, status="running").exists():
                     logger.info(
-                        "Scheduling DiscoveryJob for '%s' (interval=%d min)",
+                        "Skipping '%s' — a discovery run is already active",
                         target.name,
-                        target.scan_interval,
                     )
-                    DiscoveryJob.enqueue(data={"target_id": target.pk})
+                    continue
+
+                logger.info(
+                    "Scheduling DiscoveryJob for '%s' (interval=%d min)",
+                    target.name,
+                    target.scan_interval,
+                )
+                DiscoveryJob.enqueue(data={"target_id": target.pk})
 
 except ImportError:
     logger.warning(

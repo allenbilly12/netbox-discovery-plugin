@@ -1,4 +1,3 @@
-import base64
 import logging
 
 from django.db import models

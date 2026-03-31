@@ -31,9 +31,10 @@ def crawl(
     preferred_driver: str = "auto",
     max_depth: int = 3,
     discovery_protocol: str = "both",
-    on_device_data: Optional[Callable[[str, Dict[str, Any], str], None]] = None,
+    on_device_data: Optional[Callable[[str, Dict[str, Any], str, Callable], None]] = None,
     on_device_failed: Optional[Callable[[str, str], None]] = None,
     log_fn: Optional[Callable[[str], None]] = None,
+    log_batch_fn: Optional[Callable[[List[str]], None]] = None,
     stop_flag: Optional[Callable[[], bool]] = None,
     max_workers: int = 5,
 ) -> Dict[str, Any]:
@@ -48,12 +49,14 @@ def crawl(
         timeout: SSH timeout per connection.
         preferred_driver: 'auto' or specific NAPALM driver name.
         max_depth: Maximum neighbor recursion depth.
-        on_device_data: Callback invoked with (ip, device_data_dict, driver_name)
-                        for each successfully collected device. Typically writes
-                        to NetBox.
+        on_device_data: Callback invoked with (ip, device_data_dict, driver_name,
+                        device_log_fn) for each successfully collected device.
+                        device_log_fn buffers messages for this device.
         on_device_failed: Optional callback invoked with (ip, error_message) for
                           each device that failed to connect or collect data.
         log_fn: Optional log/progress callback (must be thread-safe).
+        log_batch_fn: Optional callback that flushes a list of log lines
+                      atomically (keeps per-device output grouped).
         stop_flag: Optional callable that returns True to abort early.
         max_workers: Number of devices to process in parallel.
 
@@ -97,6 +100,17 @@ def crawl(
         f"workers={actual_workers}, collect_timeout={collect_timeout}s"
     )
 
+    def _flush_device_log(lines: List[str]):
+        """Flush buffered per-device log lines as one atomic block."""
+        if not lines:
+            return
+        if log_batch_fn:
+            log_batch_fn(lines)
+        else:
+            # Fallback: flush line-by-line (may interleave with other threads)
+            for line in lines:
+                log_fn(line)
+
     def worker():
         # Each thread needs its own Django DB connection released on exit.
         try:
@@ -114,6 +128,17 @@ def crawl(
                     break
 
                 ip, depth = item
+
+                # Per-device log buffer: all messages for this device are
+                # collected here and flushed as one contiguous block when
+                # processing completes, preventing interleaved output from
+                # concurrent worker threads.
+                device_lines: List[str] = []
+
+                def device_log(msg, _buf=device_lines):
+                    """Buffer a log message for the current device."""
+                    _buf.append(msg)
+
                 try:
                     if stop_flag():
                         with lock:
@@ -128,9 +153,8 @@ def crawl(
                         n_visited = len(visited)
 
                     remaining = work_queue.qsize()
-                    log_fn(
-                        f"[depth={depth}] Connecting to {ip}... "
-                        f"(queue≈{remaining}, visited={n_visited})"
+                    device_log(
+                        f"--- [{ip}] depth={depth} (queue≈{remaining}, visited={n_visited}) ---"
                     )
 
                     device, driver_name = detect_and_connect(
@@ -140,11 +164,11 @@ def crawl(
                         enable_secret=enable_secret,
                         timeout=timeout,
                         preferred_driver=preferred_driver,
-                        log_fn=log_fn,
+                        log_fn=device_log,
                     )
 
                     if device is None:
-                        log_fn(f"  [FAILED] {ip} — could not connect with any driver. Skipping.")
+                        device_log(f"  [FAILED] {ip} — could not connect with any driver. Skipping.")
                         with lock:
                             summary["failed"] += 1
                         if on_device_failed:
@@ -152,7 +176,7 @@ def crawl(
                         continue
 
                     try:
-                        log_fn(
+                        device_log(
                             f"  [OK] Connected via '{driver_name}'. "
                             f"Collecting data (timeout={collect_timeout}s)..."
                         )
@@ -160,12 +184,12 @@ def crawl(
                         # stall this worker thread indefinitely.
                         executor = ThreadPoolExecutor(max_workers=1)
                         future = executor.submit(
-                            collect_device_data, device, driver_name, discovery_protocol, log_fn
+                            collect_device_data, device, driver_name, discovery_protocol, device_log
                         )
                         try:
                             data = future.result(timeout=collect_timeout)
                         except FuturesTimeoutError:
-                            log_fn(
+                            device_log(
                                 f"  [ERROR] Data collection for {ip} timed out "
                                 f"after {collect_timeout}s — skipping device"
                             )
@@ -180,21 +204,21 @@ def crawl(
 
                         facts = data.get("facts", {})
                         hostname = facts.get("hostname", ip)
-                        log_fn(
+                        device_log(
                             f"  Hostname: {hostname} | Vendor: {facts.get('vendor', '?')} "
                             f"| Model: {facts.get('model', '?')} | Serial: {facts.get('serial_number', '?')}"
                         )
 
                         if data.get("raw_errors"):
                             for err in data["raw_errors"]:
-                                log_fn(f"  [WARN] {err}")
+                                device_log(f"  [WARN] {err}")
 
-                        # NetBox sync
+                        # NetBox sync — pass buffered log so sync output stays grouped
                         if on_device_data:
                             try:
-                                on_device_data(ip, data, driver_name)
+                                on_device_data(ip, data, driver_name, device_log)
                             except Exception as exc:
-                                log_fn(f"  [ERROR] NetBox sync failed for {ip}: {exc} — continuing")
+                                device_log(f"  [ERROR] NetBox sync failed for {ip}: {exc} — continuing")
                                 logger.exception("Sync error for %s", ip)
 
                         with lock:
@@ -210,17 +234,17 @@ def crawl(
                                         queued.add(neighbor_ip)
                                         enqueue = True
                                     elif neighbor_ip in queued and neighbor_ip not in visited:
-                                        log_fn(
+                                        device_log(
                                             f"  Neighbor {neighbor_ip} already queued — skipping duplicate"
                                         )
                                 if enqueue:
-                                    log_fn(f"  Queuing neighbor: {neighbor_ip} (depth={depth + 1})")
+                                    device_log(f"  Queuing neighbor: {neighbor_ip} (depth={depth + 1})")
                                     work_queue.put((neighbor_ip, depth + 1))
                                     with lock:
                                         summary["neighbors_queued"] += 1
 
                     except Exception as exc:
-                        log_fn(f"  [ERROR] Data collection failed for {ip}: {exc} — skipping device")
+                        device_log(f"  [ERROR] Data collection failed for {ip}: {exc} — skipping device")
                         logger.exception("Collection error for %s", ip)
                         with lock:
                             summary["failed"] += 1
@@ -233,11 +257,13 @@ def crawl(
                             pass
 
                 except Exception as exc:
-                    log_fn(f"[ERROR] Unexpected error processing {ip}: {exc} — continuing")
+                    device_log(f"[ERROR] Unexpected error processing {ip}: {exc} — continuing")
                     logger.exception("Unexpected crawl error for %s", ip)
                     with lock:
                         summary["failed"] += 1
                 finally:
+                    # Flush all buffered lines for this device as one atomic block.
+                    _flush_device_log(device_lines)
                     work_queue.task_done()
 
         finally:
@@ -293,10 +319,10 @@ def _is_valid_ip(ip: str) -> bool:
 
 
 def _is_link_local(ip: str) -> bool:
-    """Skip link-local and loopback addresses."""
+    """Return True for link-local and loopback addresses (should not be crawled)."""
     try:
         import netaddr
         addr = netaddr.IPAddress(ip)
-        return addr.is_link_local() or addr.is_loopback() or addr.is_private() and str(ip).startswith("127.")
+        return addr.is_link_local() or addr.is_loopback()
     except Exception:
         return False

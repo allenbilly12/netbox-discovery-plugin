@@ -41,3 +41,6 @@ class DiscoveryRunFilterSet(NetBoxModelFilterSet):
     class Meta:
         model = DiscoveryRun
         fields = ("target_id", "status")
+
+    def search(self, queryset, name, value):
+        return queryset.filter(target__name__icontains=value)

@@ -1,3 +1,5 @@
+import netaddr
+
 from django import forms
 from netbox.forms import NetBoxModelForm, NetBoxModelFilterSetForm
 from utilities.forms.fields import TagFilterField
@@ -73,6 +75,28 @@ class DiscoveryTargetForm(NetBoxModelForm):
             "max_workers": forms.NumberInput(attrs={"min": 1, "max": 50}),
             "scan_interval": forms.NumberInput(attrs={"min": 0}),
         }
+
+    def _validate_ip_lines(self, field_name: str) -> str:
+        """Validate that every non-blank line is a valid IP address or CIDR."""
+        value = self.cleaned_data.get(field_name, "")
+        errors = []
+        for line in value.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                netaddr.IPNetwork(line, implicit_prefix=False)
+            except (netaddr.AddrFormatError, ValueError):
+                errors.append(f"'{line}' is not a valid IP address or CIDR range.")
+        if errors:
+            raise forms.ValidationError(errors)
+        return value
+
+    def clean_targets(self):
+        return self._validate_ip_lines("targets")
+
+    def clean_exclusions(self):
+        return self._validate_ip_lines("exclusions")
 
     def save(self, commit=True):
         instance = super().save(commit=False)

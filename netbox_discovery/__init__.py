@@ -18,6 +18,7 @@ class DiscoveryConfig(PluginConfig):
         "default_username": "",
         "default_password": "",
         "default_enable_secret": "",
+        "conflict_log_path": "/var/log/netbox/discovery_conflicts.log",
     }
 
     required_config = []
