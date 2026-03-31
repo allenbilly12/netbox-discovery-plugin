@@ -1,6 +1,6 @@
-# CLAUDE.md — netbox-discovery-plugin
+# AGENTS.md — netbox-discovery-plugin
 
-Project instructions and context for Claude Code.
+Project instructions and context for Codex.
 
 ## Project Overview
 
