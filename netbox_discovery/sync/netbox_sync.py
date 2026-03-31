@@ -198,6 +198,15 @@ def sync_device(
             role=role,
             serial=serial,
         )
+        if was_created:
+            _add_journal_entry(
+                device,
+                (
+                    "Discovery created this device from collected facts: "
+                    f"hostname={hostname}, vendor={vendor}, model={model}, serial={serial or 'N/A'}, "
+                    f"mgmt_ip={mgmt_ip}."
+                ),
+            )
 
         if (
             not was_created
@@ -250,14 +259,18 @@ def sync_device(
         if device.site_id == site.pk:
             matched_site = _match_site_by_hostname(hostname, exclude_site_name=holding_site_name)
             if matched_site:
+                old_site_name = getattr(device.site, "name", holding_site_name)
                 device.site = matched_site
                 changed = True
                 log_fn(f"  Auto-assigned site '{matched_site.name}' from hostname prefix.")
+                device_field_changes.append(f"site '{old_site_name}' -> '{matched_site.name}'")
 
         # Update role if classification improved (e.g. model was unknown before)
         if device.role_id != role.pk:
+            old_role = getattr(getattr(device, "role", None), "name", "unknown")
             device.role = role
             changed = True
+            device_field_changes.append(f"role '{old_role}' -> '{role.name}'")
 
         if changed:
             device.save()
@@ -271,8 +284,16 @@ def sync_device(
         _sync_device_tags(device, classification["tags"], log_fn)
 
         # --- Interfaces ---
-        interface_stats = _sync_interfaces(device, interfaces_raw, log_fn)
-        if interface_stats["created"] or interface_stats["updated"] or interface_stats["deleted"]:
+        interfaces_step_status = (data.get("step_status") or {}).get("interfaces")
+        prune_stale = interfaces_step_status != "fail"
+        interface_stats = _sync_interfaces(device, interfaces_raw, log_fn, prune_stale=prune_stale)
+        if (
+            interface_stats["created"]
+            or interface_stats["updated"]
+            or interface_stats["deleted"]
+            or interface_stats["delete_failed"]
+            or interface_stats["prune_skipped"]
+        ):
             parts = []
             if interface_stats["created"]:
                 parts.append(f"created={interface_stats['created']}")
@@ -282,6 +303,10 @@ def sync_device(
                 parts.append(
                     f"deleted={interface_stats['deleted']} ({', '.join(interface_stats['deleted_names'])})"
                 )
+            if interface_stats["delete_failed"]:
+                parts.append(f"delete_failed={interface_stats['delete_failed']}")
+            if interface_stats["prune_skipped"]:
+                parts.append("prune_skipped=yes (interface collection failed)")
             _add_journal_entry(
                 device,
                 "Discovery synchronized interfaces: " + "; ".join(parts) + ".",
@@ -289,7 +314,16 @@ def sync_device(
         _sync_lag_members(device, lag_members, log_fn)
 
         # --- IP Addresses ---
-        primary_ip = _sync_ips(device, interfaces_ip, mgmt_ip, log_fn)
+        primary_ip, ip_stats = _sync_ips(device, interfaces_ip, mgmt_ip, log_fn)
+        if ip_stats["created"] or ip_stats["reassigned"] or ip_stats["conflicts"] or ip_stats["mgmt_created"]:
+            _add_journal_entry(
+                device,
+                (
+                    "Discovery synchronized IP assignments: "
+                    f"created={ip_stats['created']}, reassigned={ip_stats['reassigned']}, "
+                    f"conflicts={ip_stats['conflicts']}, mgmt_created={ip_stats['mgmt_created']}."
+                ),
+            )
 
         # --- Set primary IP ---
         if primary_ip and device.primary_ip4 != primary_ip:
@@ -315,6 +349,20 @@ def sync_device(
                         conflict.save()
                         device.primary_ip4 = primary_ip
                         device.save()
+                        _add_journal_entry(
+                            conflict,
+                            (
+                                "Discovery cleared primary IPv4 during domain-variant conflict auto-resolution: "
+                                f"{primary_ip} moved to '{hostname}'."
+                            ),
+                        )
+                        _add_journal_entry(
+                            device,
+                            (
+                                "Discovery auto-resolved primary IPv4 conflict by clearing "
+                                f"domain-variant '{conflict.name}' and assigning {primary_ip}."
+                            ),
+                        )
                         log_fn(
                             f"  Auto-resolved primary IP conflict: cleared primary from "
                             f"domain-variant '{conflict.name}' (id={conflict.pk}), "
@@ -341,6 +389,10 @@ def sync_device(
             else:
                 device.primary_ip4 = primary_ip
                 device.save()
+                _add_journal_entry(
+                    device,
+                    f"Discovery set primary IPv4 to {primary_ip} (mgmt={mgmt_ip}).",
+                )
 
         # --- VLANs ---
         _sync_vlans(vlans_raw, site, log_fn)
@@ -425,6 +477,10 @@ def _sync_device_tags(device, tag_slugs: List[str], log_fn: Callable):
 
     if added:
         log_fn(f"  Auto-tagged: {', '.join(added)}")
+        _add_journal_entry(
+            device,
+            f"Discovery auto-tagged device: {', '.join(added)}.",
+        )
 
 
 def _base_hostname(name: str) -> str:
@@ -651,12 +707,14 @@ def _perform_hardware_refresh(old_device, hostname: str, new_device_type, role, 
     return replacement
 
 
-def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable):
+def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale: bool = True):
     from dcim.models import Interface
 
     created_count = 0
     updated_count = 0
     deleted_names: List[str] = []
+    delete_failed = 0
+    prune_skipped = False
     desired_ifaces = set(interfaces_raw.keys())
 
     for iface_name, iface_data in interfaces_raw.items():
@@ -700,15 +758,24 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable):
                 updated_count += 1
 
     # Only delete stale interfaces if we received a non-empty interface payload.
-    if desired_ifaces:
+    # This protects against accidental mass deletions from empty collector output.
+    if desired_ifaces and not prune_stale:
+        prune_skipped = True
+        log_fn(
+            f"  [WARN] Interface pruning skipped for {device.name}: "
+            "get_interfaces() failed for this device in the collector."
+        )
+    elif desired_ifaces:
         stale_qs = Interface.objects.filter(device=device).exclude(name__in=desired_ifaces)
         for stale_iface in stale_qs:
             stale_name = stale_iface.name
             try:
+                _detach_interface_dependencies(stale_iface, log_fn)
                 stale_iface.delete()
                 deleted_names.append(stale_name)
                 log_fn(f"  [Interface] Deleted stale interface {device.name}/{stale_name}")
             except Exception as exc:
+                delete_failed += 1
                 log_fn(
                     f"  [WARN] Could not delete stale interface {device.name}/{stale_name}: {exc}"
                 )
@@ -718,7 +785,48 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable):
         "updated": updated_count,
         "deleted": len(deleted_names),
         "deleted_names": deleted_names,
+        "delete_failed": delete_failed,
+        "prune_skipped": prune_skipped,
     }
+
+
+def _detach_interface_dependencies(iface, log_fn: Callable) -> None:
+    """Remove references that commonly block stale interface deletion."""
+    from dcim.models import Interface
+    from django.contrib.contenttypes.models import ContentType
+    from ipam.models import IPAddress
+
+    # Remove any child LAG memberships if this interface is a parent LAG.
+    if hasattr(Interface, "lag"):
+        detached_members = Interface.objects.filter(device=iface.device, lag_id=iface.pk).update(lag=None)
+        if detached_members:
+            log_fn(
+                f"  [Interface] Detached {detached_members} member interface(s) from stale LAG "
+                f"{iface.device.name}/{iface.name}."
+            )
+
+    # If this stale interface is a LAG member, detach it from its parent.
+    if getattr(iface, "lag_id", None):
+        iface.lag = None
+        iface.save(update_fields=["lag"])
+        log_fn(f"  [Interface] Detached stale interface {iface.device.name}/{iface.name} from LAG.")
+
+    # Unassign any IPs from this interface before deletion.
+    iface_ct = ContentType.objects.get_for_model(Interface)
+    ips_qs = IPAddress.objects.filter(
+        assigned_object_type=iface_ct,
+        assigned_object_id=iface.pk,
+    )
+    ip_count = ips_qs.count()
+    if ip_count:
+        ips_qs.update(assigned_object_type=None, assigned_object_id=None)
+        log_fn(f"  [Interface] Unassigned {ip_count} IP(s) from stale interface {iface.device.name}/{iface.name}.")
+
+    # Remove attached cable so interface deletion is not blocked.
+    cable = getattr(iface, "cable", None)
+    if cable is not None:
+        cable.delete()
+        log_fn(f"  [Interface] Deleted cable attached to stale interface {iface.device.name}/{iface.name}.")
 
 
 def _sync_lag_members(device, lag_members: Dict[str, List[str]], log_fn: Callable):
@@ -806,6 +914,12 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
 
     iface_ct = ContentType.objects.get_for_model(Interface)
     primary_ip = None
+    stats = {
+        "created": 0,
+        "reassigned": 0,
+        "conflicts": 0,
+        "mgmt_created": 0,
+    }
 
     for iface_name, addr_families in interfaces_ip.items():
         # Resolve the interface object
@@ -832,6 +946,8 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
                         "status": "active",
                     },
                 )
+                if created:
+                    stats["created"] += 1
 
                 # Only move an existing IP when it's unassigned or already belongs
                 # to this device. Never steal an IP from another device.
@@ -848,6 +964,7 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
                         f"not reassigning it to {device.name}/{iface.name}."
                     )
                     log_fn(warn_msg)
+                    stats["conflicts"] += 1
                     _get_conflict_logger().warning(
                         "INTERFACE IP CONFLICT | wanted_device=%s (id=%s) | "
                         "blocking_device=%s (id=%s) | ip=%s (id=%s) | "
@@ -870,6 +987,7 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
                     ip_obj.assigned_object_type = iface_ct
                     ip_obj.assigned_object_id = iface.pk
                     ip_obj.save()
+                    stats["reassigned"] += 1
 
                 # Track which IP is the management IP for setting as primary
                 if ip_str == mgmt_ip:
@@ -891,9 +1009,11 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
                 iface_ct = ContentType.objects.get_for_model(Interface)
                 kwargs["assigned_object_type"] = iface_ct
                 kwargs["assigned_object_id"] = mgmt_iface.pk
-            primary_ip, _ = IPAddress.objects.get_or_create(address=mgmt_cidr, defaults=kwargs)
+            primary_ip, mgmt_created = IPAddress.objects.get_or_create(address=mgmt_cidr, defaults=kwargs)
+            if mgmt_created:
+                stats["mgmt_created"] += 1
 
-    return primary_ip
+    return primary_ip, stats
 
 
 def _sync_virtual_chassis(
@@ -950,6 +1070,13 @@ def _sync_virtual_chassis(
         master_changed = True
     if master_changed:
         master_device.save()
+        _add_journal_entry(
+            master_device,
+            (
+                f"Discovery updated stack membership: virtual_chassis='{vc.name}', "
+                f"position={master_device.vc_position}, priority={master_device.vc_priority}."
+            ),
+        )
 
     # Point VC master FK at this device
     if vc.master_id != master_device.pk:
@@ -1020,28 +1147,46 @@ def _sync_virtual_chassis(
                 f"  [Stack] Created member '{member_name}' "
                 f"pos={pos} serial={member_serial or 'N/A'} model={member_model or 'N/A'}"
             )
+            _add_journal_entry(
+                mem_dev,
+                (
+                    "Discovery created stack member device: "
+                    f"virtual_chassis='{vc.name}', position={pos}, serial={member_serial or 'N/A'}, "
+                    f"model={member_model or member_dtype.model}."
+                ),
+            )
         else:
             changed = False
+            member_changes: List[str] = []
             if mem_dev.virtual_chassis_id != vc.pk:
                 mem_dev.virtual_chassis = vc
                 changed = True
+                member_changes.append(f"virtual_chassis -> '{vc.name}'")
             if mem_dev.vc_position != pos:
                 mem_dev.vc_position = pos
                 changed = True
+                member_changes.append(f"position -> {pos}")
             if member_serial and mem_dev.serial != member_serial:
                 mem_dev.serial = member_serial
                 changed = True
+                member_changes.append(f"serial -> '{member_serial}'")
             if mem_dev.device_type_id != member_dtype.pk:
                 mem_dev.device_type = member_dtype
                 changed = True
+                member_changes.append(f"model -> '{member_dtype.model}'")
             if mem_dev.site_id != master_device.site_id:
                 mem_dev.site = master_device.site
                 changed = True
+                member_changes.append(f"site -> '{master_device.site.name}'")
             if changed:
                 mem_dev.save()
                 log_fn(
                     f"  [Stack] Updated member '{mem_dev.name}' "
                     f"pos={pos} serial={member_serial or 'N/A'}"
+                )
+                _add_journal_entry(
+                    mem_dev,
+                    "Discovery updated stack member attributes: " + "; ".join(member_changes) + ".",
                 )
 
         # Auto-tag member device

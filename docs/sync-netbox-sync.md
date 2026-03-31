@@ -2,7 +2,7 @@
 
 ## Purpose
 
-All NetBox write logic. Translates collected device data into NetBox ORM operations. **Never deletes anything** — only `get_or_create` and updates.
+All NetBox write logic. Translates collected device data into NetBox ORM operations. Device records are never deleted by discovery; stale interfaces may be removed when a successful interface inventory indicates they no longer exist on the device.
 
 ---
 
@@ -19,13 +19,14 @@ Main entry point. Called once per device from `jobs.py`'s `on_device` callback.
 5. **Update mutable fields** — device_type, serial, os_version custom field, role (re-classified on each sync).
 6. **Hostname-to-site matching** — `_match_site_by_hostname()`: if device is on holding site, try to find a real site whose name is a prefix of the hostname (e.g. `GBLON10SWI01` → site `GBLON10`).
 7. **Auto-tagging** — `_sync_device_tags()` applies classification-derived tags (vendor, device type, series) to the device. Tags are additive — never removed.
-8. **Interfaces** — `_sync_interfaces()`: `get_or_create` each interface, update enabled/description/MTU/MAC.
+8. **Interfaces** — `_sync_interfaces()`: `get_or_create` each interface, update enabled/description/MTU/MAC, and prune stale interfaces after detaching cable/IP/LAG dependencies. Pruning is skipped when collector `get_interfaces()` failed for that device.
 9. **IP Addresses** — `_sync_ips()`: `get_or_create` each IP, assign to interface. Returns management IP object.
 10. **Primary IP** — set `device.primary_ip4`. If conflict detected:
    - If blocker is a **domain-variant** (same base hostname): auto-resolve by clearing blocker's primary IP.
    - Otherwise: log WARNING to conflict file and skip.
 11. **VLANs** — `_sync_vlans()`: `get_or_create` each VLAN scoped to holding site.
 12. **Virtual Chassis** — `_sync_virtual_chassis()`: if `stack_members > 1`, create/update VC + member devices.
+13. **Journal entries** — whenever discovery changes a `Device` (create, attributes, tags, interface sync summary, IP sync summary, primary IP changes/conflict auto-resolution, stack membership/member updates), a device journal entry is written.
 
 ---
 
