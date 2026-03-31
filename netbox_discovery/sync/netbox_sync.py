@@ -199,21 +199,51 @@ def sync_device(
             serial=serial,
         )
 
+        if (
+            not was_created
+            and serial
+            and device.serial
+            and device.serial != serial
+            and device.device_type_id != dtype.pk
+        ):
+            refreshed = _perform_hardware_refresh(
+                old_device=device,
+                hostname=hostname,
+                new_device_type=dtype,
+                role=role,
+                serial=serial,
+                log_fn=log_fn,
+            )
+            if refreshed is not None:
+                device = refreshed
+                was_created = True
+
         # Update mutable fields regardless of creation
         changed = False
+        device_field_changes: List[str] = []
         if device.device_type != dtype:
+            old_model = (
+                device.device_type.model
+                if getattr(device, "device_type", None) is not None
+                else "unknown"
+            )
             device.device_type = dtype
             changed = True
+            device_field_changes.append(f"model '{old_model}' -> '{dtype.model}'")
         if serial and device.serial != serial:
+            old_serial = device.serial or "N/A"
             device.serial = serial
             changed = True
+            device_field_changes.append(f"serial '{old_serial}' -> '{serial}'")
         if os_version:
             try:
                 cf = device.custom_field_data or {}
                 if cf.get("os_version") != os_version:
+                    old_os = cf.get("os_version") or "N/A"
                     cf["os_version"] = os_version
                     device.custom_field_data = cf
                     changed = True
+                    device_field_changes.append(f"os_version '{old_os}' -> '{os_version}'")
             except Exception as exc:
                 log_fn(f"  [WARN] Could not set os_version custom field: {exc}")
         # --- Hostname-to-site auto-assignment (only if still on holding site) ---
@@ -231,12 +261,31 @@ def sync_device(
 
         if changed:
             device.save()
+        if device_field_changes:
+            _add_journal_entry(
+                device,
+                "Discovery updated device attributes: " + "; ".join(device_field_changes) + ".",
+            )
 
         # --- Auto-assign tags based on classification ---
         _sync_device_tags(device, classification["tags"], log_fn)
 
         # --- Interfaces ---
-        _sync_interfaces(device, interfaces_raw, log_fn)
+        interface_stats = _sync_interfaces(device, interfaces_raw, log_fn)
+        if interface_stats["created"] or interface_stats["updated"] or interface_stats["deleted"]:
+            parts = []
+            if interface_stats["created"]:
+                parts.append(f"created={interface_stats['created']}")
+            if interface_stats["updated"]:
+                parts.append(f"updated={interface_stats['updated']}")
+            if interface_stats["deleted"]:
+                parts.append(
+                    f"deleted={interface_stats['deleted']} ({', '.join(interface_stats['deleted_names'])})"
+                )
+            _add_journal_entry(
+                device,
+                "Discovery synchronized interfaces: " + "; ".join(parts) + ".",
+            )
         _sync_lag_members(device, lag_members, log_fn)
 
         # --- IP Addresses ---
@@ -511,8 +560,104 @@ def _get_or_create_device(
     return device, True
 
 
+def _device_decommission_status() -> str:
+    try:
+        from dcim.choices import DeviceStatusChoices
+
+        for attr in ("STATUS_DECOMMISSIONING", "DECOMMISSIONING"):
+            if hasattr(DeviceStatusChoices, attr):
+                return getattr(DeviceStatusChoices, attr)
+    except Exception:
+        pass
+    return "decommissioning"
+
+
+def _next_available_device_name(base_name: str) -> str:
+    from dcim.models import Device
+
+    if not Device.objects.filter(name=base_name).exists():
+        return base_name
+
+    idx = 1
+    while True:
+        candidate = f"{base_name}-old-{idx}"
+        if not Device.objects.filter(name=candidate).exists():
+            return candidate
+        idx += 1
+
+
+def _perform_hardware_refresh(old_device, hostname: str, new_device_type, role, serial: str, log_fn: Callable):
+    from dcim.models import Device, Interface
+    from ipam.models import IPAddress
+    from django.contrib.contenttypes.models import ContentType
+
+    old_model = old_device.device_type.model if old_device.device_type_id else "Unknown"
+    new_model = new_device_type.model
+    old_serial = old_device.serial or "N/A"
+
+    # Clear IP ownership from interfaces on the old device so the replacement can
+    # safely claim the same addresses during sync (notably management/primary IP).
+    iface_ids = list(
+        Interface.objects.filter(device=old_device).values_list("pk", flat=True)
+    )
+    released_ip_count = 0
+    if iface_ids:
+        iface_ct = ContentType.objects.get_for_model(Interface)
+        ips_to_release = IPAddress.objects.filter(
+            assigned_object_type=iface_ct,
+            assigned_object_id__in=iface_ids,
+        )
+        released_ip_count = ips_to_release.count()
+        ips_to_release.update(assigned_object_type=None, assigned_object_id=None)
+
+    if old_device.primary_ip4_id or getattr(old_device, "primary_ip6_id", None):
+        old_device.primary_ip4 = None
+        if hasattr(old_device, "primary_ip6"):
+            old_device.primary_ip6 = None
+
+    archive_name = _next_available_device_name(old_device.name)
+    old_device_name = old_device.name
+    old_device.status = _device_decommission_status()
+    old_device.name = archive_name
+    old_device.save()
+
+    replacement = Device.objects.create(
+        name=hostname,
+        site=old_device.site,
+        device_type=new_device_type,
+        role=role,
+        serial=serial,
+        status="active",
+        platform=old_device.platform,
+        tenant=old_device.tenant,
+        location=old_device.location,
+        comments=old_device.comments,
+        custom_field_data=old_device.custom_field_data or {},
+    )
+    replacement.tags.set(old_device.tags.all())
+
+    refresh_note = (
+        "Discovery detected hardware refresh (serial and model changed): "
+        f"{old_model}/{old_serial} -> {new_model}/{serial}. "
+        f"Decommissioned prior device '{archive_name}' and created replacement '{hostname}'."
+    )
+    _add_journal_entry(old_device, refresh_note)
+    _add_journal_entry(replacement, refresh_note)
+    log_fn(
+        f"  [Refresh] {old_model}/{old_serial} replaced by {new_model}/{serial}. "
+        f"Archived '{old_device_name}' as '{archive_name}' (status={old_device.status}, "
+        f"released_ips={released_ip_count})."
+    )
+    return replacement
+
+
 def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable):
     from dcim.models import Interface
+
+    created_count = 0
+    updated_count = 0
+    deleted_names: List[str] = []
+    desired_ifaces = set(interfaces_raw.keys())
 
     for iface_name, iface_data in interfaces_raw.items():
         iface_type = map_interface_type(iface_name)
@@ -521,6 +666,8 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable):
             name=iface_name,
             defaults={"type": iface_type},
         )
+        if created:
+            created_count += 1
 
         changed = False
         enabled = iface_data.get("is_enabled", True)
@@ -549,6 +696,29 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable):
 
         if changed:
             iface.save()
+            if not created:
+                updated_count += 1
+
+    # Only delete stale interfaces if we received a non-empty interface payload.
+    if desired_ifaces:
+        stale_qs = Interface.objects.filter(device=device).exclude(name__in=desired_ifaces)
+        for stale_iface in stale_qs:
+            stale_name = stale_iface.name
+            try:
+                stale_iface.delete()
+                deleted_names.append(stale_name)
+                log_fn(f"  [Interface] Deleted stale interface {device.name}/{stale_name}")
+            except Exception as exc:
+                log_fn(
+                    f"  [WARN] Could not delete stale interface {device.name}/{stale_name}: {exc}"
+                )
+
+    return {
+        "created": created_count,
+        "updated": updated_count,
+        "deleted": len(deleted_names),
+        "deleted_names": deleted_names,
+    }
 
 
 def _sync_lag_members(device, lag_members: Dict[str, List[str]], log_fn: Callable):
