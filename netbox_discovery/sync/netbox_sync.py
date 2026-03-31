@@ -305,6 +305,8 @@ def sync_device(
                 )
             if interface_stats["delete_failed"]:
                 parts.append(f"delete_failed={interface_stats['delete_failed']}")
+            if interface_stats.get("stale_count"):
+                parts.append(f"stale_detected={interface_stats['stale_count']}")
             if interface_stats["prune_skipped"]:
                 parts.append("prune_skipped=yes (interface collection failed)")
             _add_journal_entry(
@@ -759,6 +761,8 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
 
     # Only delete stale interfaces if we received a non-empty interface payload.
     # This protects against accidental mass deletions from empty collector output.
+    existing_count = Interface.objects.filter(device=device).count()
+    stale_count = 0
     if desired_ifaces and not prune_stale:
         prune_skipped = True
         log_fn(
@@ -767,6 +771,12 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
         )
     elif desired_ifaces:
         stale_qs = Interface.objects.filter(device=device).exclude(name__in=desired_ifaces)
+        stale_count = stale_qs.count()
+        if stale_count:
+            log_fn(
+                f"  [Interface] Reconciling {device.name}: discovered={len(desired_ifaces)}, "
+                f"existing={existing_count}, stale={stale_count}."
+            )
         for stale_iface in stale_qs:
             stale_name = stale_iface.name
             try:
@@ -777,7 +787,8 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
             except Exception as exc:
                 delete_failed += 1
                 log_fn(
-                    f"  [WARN] Could not delete stale interface {device.name}/{stale_name}: {exc}"
+                    f"  [WARN] Could not delete stale interface {device.name}/{stale_name}: "
+                    f"{type(exc).__name__}: {exc}"
                 )
 
     return {
@@ -787,6 +798,7 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
         "deleted_names": deleted_names,
         "delete_failed": delete_failed,
         "prune_skipped": prune_skipped,
+        "stale_count": stale_count,
     }
 
 
@@ -810,6 +822,19 @@ def _detach_interface_dependencies(iface, log_fn: Callable) -> None:
         iface.lag = None
         iface.save(update_fields=["lag"])
         log_fn(f"  [Interface] Detached stale interface {iface.device.name}/{iface.name} from LAG.")
+
+    # Detach parent/child interface relationships (subinterfaces).
+    if hasattr(Interface, "parent"):
+        detached_children = Interface.objects.filter(device=iface.device, parent_id=iface.pk).update(parent=None)
+        if detached_children:
+            log_fn(
+                f"  [Interface] Detached {detached_children} child interface(s) from stale parent "
+                f"{iface.device.name}/{iface.name}."
+            )
+        if getattr(iface, "parent_id", None):
+            iface.parent = None
+            iface.save(update_fields=["parent"])
+            log_fn(f"  [Interface] Detached stale interface {iface.device.name}/{iface.name} from parent.")
 
     # Unassign any IPs from this interface before deletion.
     iface_ct = ContentType.objects.get_for_model(Interface)
