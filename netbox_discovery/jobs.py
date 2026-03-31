@@ -123,7 +123,16 @@ class DiscoveryJob(JobRunner):
                 return
 
             # Step 2: BFS crawl + NetBox sync
-            def on_device(ip, device_data, driver_name, device_log_fn=None):
+            def on_device(*callback_args, **_callback_kwargs):
+                """Handle device data callback from crawl() across callback signature variants."""
+                if len(callback_args) < 3:
+                    raise ValueError(
+                        "on_device callback expected at least 3 positional args "
+                        f"(ip, device_data, driver_name); got {len(callback_args)}"
+                    )
+
+                ip, device_data, driver_name = callback_args[:3]
+                device_log_fn = callback_args[3] if len(callback_args) > 3 else None
                 _log = device_log_fn or log_fn
                 try:
                     device_data["driver"] = driver_name
