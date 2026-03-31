@@ -328,6 +328,36 @@ def sync_device(
             )
 
         # --- Set primary IP ---
+        existing_primary = device.primary_ip4
+        ips_step_status = (data.get("step_status") or {}).get("interfaces_ip")
+        can_verify_primary_presence = ips_step_status != "fail"
+        existing_primary_present = (
+            _is_existing_primary_present_on_device(device, interfaces_ip)
+            if existing_primary and can_verify_primary_presence
+            else True
+        )
+        if (
+            primary_ip
+            and existing_primary
+            and existing_primary != primary_ip
+            and existing_primary_present
+        ):
+            # Preserve user-selected/stable primary IP as long as it still
+            # exists on this device. Only change when it is no longer present.
+            log_fn(
+                f"  Preserving existing primary IPv4 {existing_primary} on '{hostname}' "
+                f"(candidate from discovery was {primary_ip})."
+            )
+            _add_journal_entry(
+                device,
+                (
+                    "Discovery preserved existing primary IPv4 "
+                    f"{existing_primary}; discovered candidate {primary_ip} was ignored "
+                    "because the current primary still exists on the device."
+                ),
+            )
+            primary_ip = existing_primary
+
         if primary_ip and device.primary_ip4 != primary_ip:
             # Guard against the unique constraint on primary_ip4_id:
             # if another device already owns this IP as primary, skip rather than crash.
@@ -1039,6 +1069,33 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
                 stats["mgmt_created"] += 1
 
     return primary_ip, stats
+
+
+def _is_existing_primary_present_on_device(device, interfaces_ip: Dict) -> bool:
+    """
+    Return True when device.primary_ip4 still exists on one of this device's
+    currently collected interfaces.
+    """
+    primary = getattr(device, "primary_ip4", None)
+    if primary is None:
+        return False
+
+    assigned_obj = getattr(primary, "assigned_object", None)
+    assigned_dev = getattr(assigned_obj, "device", None)
+    if assigned_obj is None or assigned_dev is None or assigned_dev.pk != device.pk:
+        return False
+
+    collected_cidrs = set()
+    for _iface_name, addr_families in (interfaces_ip or {}).items():
+        ipv4 = (addr_families or {}).get("ipv4", {})
+        for ip_str, ip_info in (ipv4 or {}).items():
+            try:
+                prefix_len = (ip_info or {}).get("prefix_length", 32)
+            except Exception:
+                prefix_len = 32
+            collected_cidrs.add(f"{ip_str}/{prefix_len}")
+
+    return str(primary.address) in collected_cidrs
 
 
 def _sync_virtual_chassis(

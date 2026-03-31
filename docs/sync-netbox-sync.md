@@ -22,6 +22,8 @@ Main entry point. Called once per device from `jobs.py`'s `on_device` callback.
 8. **Interfaces** — `_sync_interfaces()`: `get_or_create` each interface, update enabled/description/MTU/MAC, and prune stale interfaces after detaching cable/IP/LAG dependencies. Pruning is skipped when collector `get_interfaces()` failed for that device.
 9. **IP Addresses** — `_sync_ips()`: `get_or_create` each IP, assign to interface. Returns management IP object.
 10. **Primary IP** — set `device.primary_ip4`. If conflict detected:
+   - Preserve existing `primary_ip4` if it still exists on the device (do not overwrite with newly discovered candidate IPs).
+   - Only change `primary_ip4` when current primary is no longer present on collected interface IP data.
    - If blocker is a **domain-variant** (same base hostname): auto-resolve by clearing blocker's primary IP.
    - Otherwise: log WARNING to conflict file and skip.
 11. **VLANs** — `_sync_vlans()`: `get_or_create` each VLAN scoped to holding site.
