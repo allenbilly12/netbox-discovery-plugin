@@ -92,12 +92,12 @@ class DiscoveryJob(JobRunner):
             """Flush multiple log lines atomically — keeps per-device output grouped."""
             if not messages:
                 return
+            block = "\n".join(messages)
             with log_lock:
                 log_lines.extend(messages)
                 snapshot = "\n".join(log_lines)
-            for msg in messages:
-                logger.info("[Discovery:%s] %s", target.name, msg)
-                self._safe_log(msg)
+            logger.info("[Discovery:%s]\n%s", target.name, block)
+            self._safe_log(block)
             # Single DB write for the whole block
             try:
                 run.__class__.objects.filter(pk=run.pk).update(log=snapshot)
