@@ -427,7 +427,8 @@ def sync_device(
                 )
 
         # --- VLANs ---
-        _sync_vlans(vlans_raw, site, log_fn)
+        # Use device.site (resolved real site) not the holding-site variable.
+        _sync_vlans(vlans_raw, device.site, log_fn)
 
         # --- Virtual Chassis (Cisco StackWise) ---
         if len(stack_members) > 1:
