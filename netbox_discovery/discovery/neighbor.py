@@ -14,6 +14,7 @@ import logging
 import queue as _queue_mod
 import inspect
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -173,10 +174,35 @@ def crawl(
                 # processing completes, preventing interleaved output from
                 # concurrent worker threads.
                 device_lines: List[str] = []
+                discovered_hostname: Optional[str] = None
+                device_started_at = time.monotonic()
+                warning_count = 0
+                error_count = 0
+                queued_neighbors_count = 0
+                selected_driver: Optional[str] = None
+                connect_duration: Optional[float] = None
+                collect_duration: Optional[float] = None
+                sync_duration: Optional[float] = None
+                device_status = "unknown"
 
                 def device_log(msg, _buf=device_lines):
-                    """Buffer a log message for the current device."""
-                    _buf.append(msg)
+                    """
+                    Buffer log lines with device context.
+
+                    Multi-line messages (for example Netmiko/NAPALM exceptions)
+                    are split so every physical line is still attributable to
+                    the same device in the aggregated run log.
+                    """
+                    nonlocal warning_count, error_count
+                    text = str(msg) if msg is not None else ""
+                    prefix = f"[{discovered_hostname}] " if discovered_hostname else f"[{ip} d={depth}] "
+                    lines = text.splitlines() or [""]
+                    for line in lines:
+                        if "[WARN]" in line:
+                            warning_count += 1
+                        if any(token in line for token in ("[ERROR]", "[FAILED]", "[FATAL]")):
+                            error_count += 1
+                        _buf.append(f"{prefix}{line}")
 
                 try:
                     if stop_flag():
@@ -192,10 +218,13 @@ def crawl(
                         n_visited = len(visited)
 
                     remaining = work_queue.qsize()
+                    device_log("=" * 72)
                     device_log(
-                        f"--- [{ip}] depth={depth} (queue≈{remaining}, visited={n_visited}) ---"
+                        f"[START] Processing device at depth={depth} "
+                        f"(queue~{remaining}, visited={n_visited})"
                     )
 
+                    connect_started_at = time.monotonic()
                     device, driver_name = detect_and_connect(
                         ip=ip,
                         username=username,
@@ -205,8 +234,10 @@ def crawl(
                         preferred_driver=preferred_driver,
                         log_fn=device_log,
                     )
+                    connect_duration = time.monotonic() - connect_started_at
 
                     if device is None:
+                        device_status = "connect_failed"
                         device_log(f"  [FAILED] {ip} — could not connect with any driver. Skipping.")
                         with lock:
                             summary["failed"] += 1
@@ -215,6 +246,7 @@ def crawl(
                         continue
 
                     try:
+                        selected_driver = driver_name
                         device_log(
                             f"  [OK] Connected via '{driver_name}'. "
                             f"Collecting data (timeout={collect_timeout}s)..."
@@ -222,12 +254,16 @@ def crawl(
                         # Hard wall-clock deadline so a hung NAPALM call can't
                         # stall this worker thread indefinitely.
                         executor = ThreadPoolExecutor(max_workers=1)
+                        collect_started_at = time.monotonic()
                         future = executor.submit(
                             collect_device_data, device, driver_name, discovery_protocol, device_log
                         )
                         try:
                             data = future.result(timeout=collect_timeout)
+                            collect_duration = time.monotonic() - collect_started_at
                         except FuturesTimeoutError:
+                            collect_duration = time.monotonic() - collect_started_at
+                            device_status = "collect_timed_out"
                             device_log(
                                 f"  [ERROR] Data collection for {ip} timed out "
                                 f"after {collect_timeout}s — skipping device"
@@ -243,6 +279,7 @@ def crawl(
 
                         facts = data.get("facts", {})
                         hostname = facts.get("hostname", ip)
+                        discovered_hostname = hostname
                         device_log(
                             f"  Hostname: {hostname} | Vendor: {facts.get('vendor', '?')} "
                             f"| Model: {facts.get('model', '?')} | Serial: {facts.get('serial_number', '?')}"
@@ -254,11 +291,15 @@ def crawl(
 
                         # NetBox sync — pass buffered log so sync output stays grouped
                         if on_device_data:
+                            sync_started_at = time.monotonic()
                             try:
                                 _invoke_on_device_data(
                                     on_device_data, ip, data, driver_name, device_log
                                 )
+                                sync_duration = time.monotonic() - sync_started_at
                             except Exception as exc:
+                                sync_duration = time.monotonic() - sync_started_at
+                                device_status = "sync_failed"
                                 device_log(f"  [ERROR] NetBox sync failed for {ip}: {exc} — continuing")
                                 logger.exception("Sync error for %s", ip)
 
@@ -283,8 +324,10 @@ def crawl(
                                     work_queue.put((neighbor_ip, depth + 1))
                                     with lock:
                                         summary["neighbors_queued"] += 1
+                                    queued_neighbors_count += 1
 
                     except Exception as exc:
+                        device_status = "collect_failed"
                         device_log(f"  [ERROR] Data collection failed for {ip}: {exc} — skipping device")
                         logger.exception("Collection error for %s", ip)
                         with lock:
@@ -292,17 +335,38 @@ def crawl(
                         if on_device_failed:
                             on_device_failed(ip, str(exc))
                     finally:
+                        if device_status == "unknown":
+                            device_status = "completed_with_errors" if error_count > 0 else "completed"
                         try:
                             device.close()
                         except Exception:
                             pass
 
                 except Exception as exc:
+                    device_status = "worker_failed"
                     device_log(f"[ERROR] Unexpected error processing {ip}: {exc} — continuing")
                     logger.exception("Unexpected crawl error for %s", ip)
                     with lock:
                         summary["failed"] += 1
                 finally:
+                    total_duration = time.monotonic() - device_started_at
+                    connect_s = f"{connect_duration:.1f}s" if connect_duration is not None else "n/a"
+                    collect_s = f"{collect_duration:.1f}s" if collect_duration is not None else "n/a"
+                    sync_s = f"{sync_duration:.1f}s" if sync_duration is not None else "n/a"
+                    device_log(
+                        "[SUMMARY] "
+                        f"status={device_status} "
+                        f"driver={selected_driver or 'n/a'} "
+                        f"queued={queued_neighbors_count} "
+                        f"warnings={warning_count} "
+                        f"errors={error_count} "
+                        f"connect={connect_s} "
+                        f"collect={collect_s} "
+                        f"sync={sync_s} "
+                        f"total={total_duration:.1f}s"
+                    )
+                    device_log("[END] Device processing complete")
+                    device_log("=" * 72)
                     # Flush all buffered lines for this device as one atomic block.
                     _flush_device_log(device_lines)
                     work_queue.task_done()

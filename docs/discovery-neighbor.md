@@ -31,8 +31,10 @@ Main entry point. Called by `jobs.py` after host scanning.
 
 ```python
 {
-    "visited": int,   # total unique IPs processed
+    "connected": int,        # devices successfully connected and collected
     "failed": int,    # devices that failed to connect/collect
+    "skipped": int,          # duplicates/stop-flag skips
+    "neighbors_queued": int, # new neighbor IPs added to queue
 }
 ```
 
@@ -47,6 +49,8 @@ Uses a `queue.Queue` (work queue) and a `threading.Lock` (guards `visited` set a
 - Worker threads pull `(ip, depth)` items from the queue. When done, they extract neighbor IPs and enqueue any not already visited/queued — but only if `depth < max_depth`.
 - Poison-pill shutdown: after `work_queue.join()` (all items processed), one `None` sentinel is enqueued per worker thread to unblock their `queue.get()` call.
 - Each worker closes its Django DB connection in a `finally` block so connections are returned to the pool.
+- Per-device output is buffered and flushed atomically as a block. Every physical line is prefixed with device context (`[ip d=depth]`, then `[hostname]` once discovered), so multiline exceptions remain attributable to the correct device.
+- Each device block ends with a compact `[SUMMARY]` line containing status, selected driver, warnings/errors, neighbors queued, and timing metrics (connect/collect/sync/total) for quick triage.
 
 ---
 
