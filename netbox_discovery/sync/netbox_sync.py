@@ -1412,6 +1412,7 @@ def _sync_prefixes(interfaces_ip: Dict, site, log_fn: Callable):
     from ipam.models import Prefix
 
     created_count = 0
+    error_count = 0
     for _iface_name, addr_families in interfaces_ip.items():
         for family, addrs in addr_families.items():
             for ip_str, ip_info in addrs.items():
@@ -1426,17 +1427,28 @@ def _sync_prefixes(interfaces_ip: Dict, site, log_fn: Callable):
                     if network.ip.is_link_local() or network.ip.is_loopback():
                         continue
                     cidr = str(network.cidr)
+                    defaults = {"status": "active"}
+                    if site is not None:
+                        # NetBox 4.2+ uses a generic scope field instead of Prefix.site.
+                        if hasattr(Prefix, "scope"):
+                            defaults["scope"] = site
+                        elif hasattr(Prefix, "site"):
+                            defaults["site"] = site
                     _, created = Prefix.objects.get_or_create(
                         prefix=cidr,
-                        defaults={"site": site, "status": "active"},
+                        defaults=defaults,
                     )
                     if created:
                         created_count += 1
-                except Exception:
+                except Exception as exc:
+                    error_count += 1
+                    log_fn(f"  [WARN] Failed to sync prefix {ip_str}/{prefix_len}: {exc}")
                     continue
 
     if created_count:
         log_fn(f"  [Prefix] Created {created_count} prefix(es)")
+    if error_count:
+        log_fn(f"  [WARN] Prefix sync had {error_count} error(s)")
 
 
 def _sync_vrfs(vrfs_raw: Dict, log_fn: Callable):
