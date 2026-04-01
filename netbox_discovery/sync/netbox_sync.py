@@ -1384,13 +1384,18 @@ def _sync_platform(device, driver_name: str, manufacturer, log_fn: Callable):
 
     platform = Platform.objects.filter(name__iexact=driver_name).first()
     if platform is None:
+        defaults = {
+            "slug": make_slug(driver_name),
+            "manufacturer": manufacturer,
+        }
+        # NetBox 4.x removed Platform.napalm_driver. Keep backward compatibility
+        # for environments that still expose the field.
+        if any(f.name == "napalm_driver" for f in Platform._meta.get_fields()):
+            defaults["napalm_driver"] = driver_name
+
         platform, created = Platform.objects.get_or_create(
             name=driver_name,
-            defaults={
-                "slug": make_slug(driver_name),
-                "manufacturer": manufacturer,
-                "napalm_driver": driver_name,
-            },
+            defaults=defaults,
         )
         if created:
             log_fn(f"  Created Platform '{driver_name}'")
