@@ -24,6 +24,7 @@ def collect_device_data(
     driver_name: str,
     discovery_protocol: str = "both",
     log_fn: Optional[Callable[[str], None]] = None,
+    options: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Collect all available data from an open NAPALM device.
@@ -33,12 +34,19 @@ def collect_device_data(
         driver_name: The NAPALM driver name (for logging).
         discovery_protocol: 'lldp', 'cdp', or 'both'.
         log_fn: Optional progress callback (same as job log_fn).
+        options: Plugin config options (collect_vrfs, collect_inventory, etc.).
 
     Returns:
-        Dict with keys: facts, interfaces, interfaces_ip, vlans, neighbors, raw_errors.
+        Dict with keys: facts, interfaces, interfaces_ip, vlans, neighbors, raw_errors,
+        and optionally vrfs, inventory_items, environment.
     """
     if log_fn is None:
         log_fn = lambda msg: logger.info(msg)
+    if options is None:
+        options = {}
+
+    collect_vrfs = options.get("collect_vrfs", False)
+    collect_inventory = options.get("collect_inventory", False)
 
     result = {
         "facts": {},
@@ -60,7 +68,19 @@ def collect_device_data(
         },
     }
 
-    STEPS = 7  # facts, interfaces, LAG, IPs, VLANs, neighbors, stack
+    # Optional data keys
+    if collect_vrfs:
+        result["vrfs"] = {}
+        result["step_status"]["vrfs"] = "pending"
+    if collect_inventory:
+        result["inventory_items"] = []
+        result["step_status"]["inventory"] = "pending"
+    # Dynamic step count based on enabled options
+    STEPS = 7  # base: facts, interfaces, LAG, IPs, VLANs, neighbors, stack
+    if collect_vrfs:
+        STEPS += 1
+    if collect_inventory:
+        STEPS += 1
 
     # --- Facts ---
     log_fn(f"    [1/{STEPS}] get_facts()...")
@@ -238,6 +258,39 @@ def collect_device_data(
     else:
         log_fn(f"    [7/{STEPS}] Not a stack or not supported ({time.monotonic()-t0:.1f}s)")
     result["stack_members"] = stack_members
+
+    # --- Optional steps (Tier 2) ---
+    next_step = 8
+
+    # --- VRFs via get_network_instances() (Tier 2.1) ---
+    if collect_vrfs:
+        log_fn(f"    [{next_step}/{STEPS}] get_network_instances()...")
+        t0 = time.monotonic()
+        try:
+            result["vrfs"] = device.get_network_instances()
+            result["step_status"]["vrfs"] = "ok"
+            log_fn(f"    [{next_step}/{STEPS}] get_network_instances() done ({time.monotonic()-t0:.1f}s) — {len(result['vrfs'])} instance(s)")
+        except Exception as exc:
+            result["step_status"]["vrfs"] = "skip"
+            log_fn(f"    [{next_step}/{STEPS}] get_network_instances() not supported ({time.monotonic()-t0:.1f}s) — skipped")
+            logger.debug("get_network_instances() failed: %s", exc)
+        next_step += 1
+
+    # --- Inventory items via show inventory (Tier 2.2) ---
+    if collect_inventory:
+        log_fn(f"    [{next_step}/{STEPS}] Inventory collection...")
+        t0 = time.monotonic()
+        try:
+            result["inventory_items"] = _collect_inventory(device, driver_name)
+            result["step_status"]["inventory"] = "ok"
+            log_fn(f"    [{next_step}/{STEPS}] Inventory done ({time.monotonic()-t0:.1f}s) — {len(result['inventory_items'])} item(s)")
+        except Exception as exc:
+            result["step_status"]["inventory"] = "fail"
+            msg = f"Inventory collection failed ({time.monotonic()-t0:.1f}s): {exc}"
+            log_fn(f"    [WARN] {msg}")
+            logger.warning(msg)
+            result["raw_errors"].append(msg)
+        next_step += 1
 
     return result
 
@@ -439,6 +492,71 @@ def _enrich_from_inventory(members: List[Dict], output: str) -> None:
                         member["serial"] = sn
                         break
                 current_pos = None
+
+
+def _collect_inventory(device, driver_name: str) -> List[Dict]:
+    """
+    Collect all inventory items via CLI 'show inventory' (IOS, NX-OS, EOS)
+    or 'show chassis hardware' (Junos).
+
+    Returns a list of dicts: [{"name": ..., "pid": ..., "serial": ..., "description": ...}]
+    """
+    commands = []
+    if driver_name in ("ios", "nxos", "nxos_ssh", "eos"):
+        commands = ["show inventory"]
+    elif driver_name == "junos":
+        commands = ["show chassis hardware"]
+    else:
+        return []
+
+    for command in commands:
+        try:
+            output = device.cli([command]).get(command, "")
+        except Exception:
+            continue
+        if output:
+            return _parse_inventory_output(output, driver_name)
+
+    return []
+
+
+def _parse_inventory_output(output: str, driver_name: str) -> List[Dict]:
+    """
+    Parse 'show inventory' style output into inventory item dicts.
+
+    Handles the standard Cisco NAME/PID/SN format:
+        NAME: "Power Supply 1", DESCR: "350W AC Power Supply"
+        PID: PWR-C1-350WAC    , VID: V01, SN: LIT12345678
+    """
+    items = []
+    name_re = re.compile(r'NAME:\s*"([^"]+)"(?:,\s*DESCR:\s*"([^"]*)")?', re.IGNORECASE)
+    pid_sn_re = re.compile(r"PID:\s*(\S+)\s*,.*SN:\s*(\S+)", re.IGNORECASE)
+
+    current_name = None
+    current_descr = ""
+
+    for line in output.splitlines():
+        nm = name_re.search(line)
+        if nm:
+            current_name = nm.group(1).strip()
+            current_descr = (nm.group(2) or "").strip()
+            continue
+
+        if current_name is not None:
+            pm = pid_sn_re.search(line)
+            if pm:
+                pid = pm.group(1).strip()
+                sn = pm.group(2).strip()
+                items.append({
+                    "name": current_name,
+                    "pid": pid,
+                    "serial": sn,
+                    "description": current_descr,
+                })
+                current_name = None
+                current_descr = ""
+
+    return items
 
 
 def _parse_cdp_neighbors(output: str) -> List[Dict]:

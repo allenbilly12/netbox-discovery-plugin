@@ -19,6 +19,14 @@ class DiscoveryConfig(PluginConfig):
         "default_password": "",
         "default_enable_secret": "",
         "conflict_log_path": "/var/log/netbox/discovery_conflicts.log",
+        # Tier 1 — always on by default
+        "sync_platform": True,
+        "sync_interface_speed": True,
+        "sync_fqdn": True,
+        "create_prefixes": False,       # opt-in (prefix management often manually curated)
+        # Tier 2 — opt-in (new NAPALM calls, extra time per device)
+        "collect_vrfs": False,
+        "collect_inventory": False,
     }
 
     required_config = []
@@ -37,6 +45,10 @@ def _on_post_migrate(sender, **kwargs):
     """Called after migrations complete — safe to query the DB here."""
     try:
         _ensure_os_version_custom_field()
+    except Exception:
+        pass
+    try:
+        _ensure_fqdn_custom_field()
     except Exception:
         pass
 
@@ -64,6 +76,31 @@ def _ensure_os_version_custom_field():
         },
     )
     # Ensure Device is in the field's object_types (ManyToMany)
+    if device_ct not in cf.object_types.all():
+        cf.object_types.add(device_ct)
+
+
+def _ensure_fqdn_custom_field():
+    from django.contrib.contenttypes.models import ContentType
+    from extras.models import CustomField
+
+    try:
+        from extras.choices import CustomFieldTypeChoices
+        cf_type = CustomFieldTypeChoices.TYPE_TEXT
+    except (ImportError, AttributeError):
+        cf_type = "text"
+
+    from dcim.models import Device
+    device_ct = ContentType.objects.get_for_model(Device)
+
+    cf, _ = CustomField.objects.get_or_create(
+        name="fqdn",
+        defaults={
+            "label": "FQDN",
+            "type": cf_type,
+            "description": "Fully qualified domain name collected by network discovery",
+        },
+    )
     if device_ct not in cf.object_types.all():
         cf.object_types.add(device_ct)
 

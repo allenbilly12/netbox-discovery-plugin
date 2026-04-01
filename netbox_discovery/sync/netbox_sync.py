@@ -104,6 +104,7 @@ def sync_device(
     data: Dict[str, Any],
     holding_site_name: str = "Holding",
     log_fn: Optional[Callable[[str], None]] = None,
+    options: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, bool]:
     """
     Synchronize discovered device data into NetBox.
@@ -113,6 +114,7 @@ def sync_device(
         data: Dict from collector.collect_device_data().
         holding_site_name: Name of the holding site (created if needed).
         log_fn: Log callback.
+        options: Plugin config options (sync_platform, sync_fqdn, etc.).
 
     Returns:
         Tuple of (device_name, was_created).
@@ -129,6 +131,10 @@ def sync_device(
     from ipam.models import IPAddress, VLAN
     from django.db import transaction
     from django.utils.text import slugify
+
+    if options is None:
+        from django.conf import settings
+        options = settings.PLUGINS_CONFIG.get("netbox_discovery", {})
 
     if log_fn is None:
         log_fn = lambda msg: logger.info(msg)
@@ -283,10 +289,28 @@ def sync_device(
         # --- Auto-assign tags based on classification ---
         _sync_device_tags(device, classification["tags"], log_fn)
 
+        # --- Platform mapping (Tier 1.1) ---
+        if options.get("sync_platform", True) and driver:
+            _sync_platform(device, driver, mfr, log_fn)
+
+        # --- FQDN custom field (Tier 1.3) ---
+        if options.get("sync_fqdn", True):
+            fqdn = (facts.get("fqdn") or "").strip()
+            if fqdn:
+                try:
+                    cf = device.custom_field_data or {}
+                    if cf.get("fqdn") != fqdn:
+                        cf["fqdn"] = fqdn
+                        device.custom_field_data = cf
+                        device.save()
+                        log_fn(f"  Set FQDN custom field: {fqdn}")
+                except Exception as exc:
+                    log_fn(f"  [WARN] Could not set fqdn custom field: {exc}")
+
         # --- Interfaces ---
         interfaces_step_status = (data.get("step_status") or {}).get("interfaces")
         prune_stale = interfaces_step_status != "fail"
-        interface_stats = _sync_interfaces(device, interfaces_raw, log_fn, prune_stale=prune_stale)
+        interface_stats = _sync_interfaces(device, interfaces_raw, log_fn, prune_stale=prune_stale, options=options)
         if (
             interface_stats["created"]
             or interface_stats["updated"]
@@ -429,6 +453,22 @@ def sync_device(
         # --- VLANs ---
         # Use device.site (resolved real site) not the holding-site variable.
         _sync_vlans(vlans_raw, device.site, log_fn)
+
+        # --- Prefixes from interface IPs (Tier 1.4) ---
+        if options.get("create_prefixes", False):
+            _sync_prefixes(interfaces_ip, device.site, log_fn)
+
+        # --- VRFs (Tier 2.1) ---
+        if options.get("collect_vrfs", False):
+            vrfs_raw = data.get("vrfs", {})
+            if vrfs_raw:
+                _sync_vrfs(vrfs_raw, log_fn)
+
+        # --- Inventory Items (Tier 2.2) ---
+        if options.get("collect_inventory", False):
+            inventory_items = data.get("inventory_items", [])
+            if inventory_items:
+                _sync_inventory_items(device, inventory_items, log_fn)
 
         # --- Virtual Chassis (Cisco StackWise) ---
         if len(stack_members) > 1:
@@ -740,8 +780,12 @@ def _perform_hardware_refresh(old_device, hostname: str, new_device_type, role, 
     return replacement
 
 
-def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale: bool = True):
+def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale: bool = True, options: Optional[Dict] = None):
     from dcim.models import Interface
+
+    if options is None:
+        options = {}
+    sync_speed = options.get("sync_interface_speed", True)
 
     created_count = 0
     updated_count = 0
@@ -785,6 +829,15 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
                 changed = True
             except Exception:
                 pass
+
+        # Interface speed sync (Tier 1.2) — NAPALM reports Mbps, NetBox stores kbps
+        if sync_speed:
+            speed_mbps = iface_data.get("speed", 0) or 0
+            if speed_mbps > 0:
+                speed_kbps = speed_mbps * 1000
+                if iface.speed != speed_kbps:
+                    iface.speed = speed_kbps
+                    changed = True
 
         if changed:
             iface.save()
@@ -1323,6 +1376,156 @@ def _sync_vlans(vlans_raw: Dict, site, log_fn: Callable):
             # Update auto-generated names with the real name
             vlan.name = vlan_name
             vlan.save()
+
+
+def _sync_platform(device, driver_name: str, manufacturer, log_fn: Callable):
+    """Map NAPALM driver to a NetBox Platform and assign to device (Tier 1.1)."""
+    from dcim.models import Platform
+
+    platform = Platform.objects.filter(name__iexact=driver_name).first()
+    if platform is None:
+        platform, created = Platform.objects.get_or_create(
+            name=driver_name,
+            defaults={
+                "slug": make_slug(driver_name),
+                "manufacturer": manufacturer,
+                "napalm_driver": driver_name,
+            },
+        )
+        if created:
+            log_fn(f"  Created Platform '{driver_name}'")
+
+    if device.platform_id != platform.pk:
+        old_platform = getattr(device.platform, "name", "none") if device.platform_id else "none"
+        device.platform = platform
+        device.save()
+        log_fn(f"  Set platform: {old_platform} -> {driver_name}")
+        _add_journal_entry(
+            device,
+            f"Discovery set platform to '{driver_name}' (from NAPALM driver).",
+        )
+
+
+def _sync_prefixes(interfaces_ip: Dict, site, log_fn: Callable):
+    """Create Prefix records from interface IP/prefix pairs (Tier 1.4)."""
+    import netaddr
+    from ipam.models import Prefix
+
+    created_count = 0
+    error_count = 0
+    for _iface_name, addr_families in interfaces_ip.items():
+        for family, addrs in addr_families.items():
+            for ip_str, ip_info in addrs.items():
+                prefix_len = ip_info.get("prefix_length", 32 if family == "ipv4" else 128)
+                # Skip host routes and link-local
+                if family == "ipv4" and prefix_len >= 32:
+                    continue
+                if family == "ipv6" and prefix_len >= 128:
+                    continue
+                try:
+                    network = netaddr.IPNetwork(f"{ip_str}/{prefix_len}")
+                    if network.ip.is_link_local() or network.ip.is_loopback():
+                        continue
+                    cidr = str(network.cidr)
+                    defaults = {"status": "active"}
+                    if site is not None:
+                        # NetBox 4.2+ uses a generic scope field instead of Prefix.site.
+                        if hasattr(Prefix, "scope"):
+                            defaults["scope"] = site
+                        elif hasattr(Prefix, "site"):
+                            defaults["site"] = site
+                    _, created = Prefix.objects.get_or_create(
+                        prefix=cidr,
+                        defaults=defaults,
+                    )
+                    if created:
+                        created_count += 1
+                except Exception as exc:
+                    error_count += 1
+                    log_fn(f"  [WARN] Failed to sync prefix {ip_str}/{prefix_len}: {exc}")
+                    continue
+
+    if created_count:
+        log_fn(f"  [Prefix] Created {created_count} prefix(es)")
+    if error_count:
+        log_fn(f"  [WARN] Prefix sync had {error_count} error(s)")
+
+
+def _sync_vrfs(vrfs_raw: Dict, log_fn: Callable):
+    """Create VRF records from get_network_instances() data (Tier 2.1)."""
+    from ipam.models import VRF
+
+    created_count = 0
+    for vrf_name, vrf_data in vrfs_raw.items():
+        if not vrf_name or vrf_name.lower() in ("default", "global"):
+            continue
+        rd = ""
+        state = vrf_data.get("state", {})
+        if isinstance(state, dict):
+            rd = state.get("route_distinguisher", "") or ""
+        defaults = {}
+        if rd:
+            defaults["rd"] = rd
+        _, created = VRF.objects.get_or_create(
+            name=vrf_name,
+            defaults=defaults,
+        )
+        if created:
+            created_count += 1
+
+    if created_count:
+        log_fn(f"  [VRF] Created {created_count} VRF(s)")
+
+
+def _sync_inventory_items(device, items: List[Dict], log_fn: Callable):
+    """Create/update InventoryItem records from show inventory data (Tier 2.2)."""
+    from dcim.models import InventoryItem
+
+    created_count = 0
+    updated_count = 0
+    for item in items:
+        item_name = (item.get("name") or "").strip()
+        if not item_name:
+            continue
+        pid = (item.get("pid") or "").strip()
+        serial = (item.get("serial") or "").strip()
+        description = (item.get("description") or "").strip()
+
+        inv_item = InventoryItem.objects.filter(device=device, name=item_name).first()
+        if inv_item is None:
+            defaults = {}
+            # 'discovered' field exists in NetBox 4.x InventoryItem
+            if hasattr(InventoryItem, "discovered"):
+                defaults["discovered"] = True
+            if pid:
+                defaults["part_id"] = pid
+            if serial:
+                defaults["serial"] = serial
+            if description:
+                defaults["description"] = description
+            InventoryItem.objects.create(device=device, name=item_name, **defaults)
+            created_count += 1
+        else:
+            changed = False
+            if pid and inv_item.part_id != pid:
+                inv_item.part_id = pid
+                changed = True
+            if serial and inv_item.serial != serial:
+                inv_item.serial = serial
+                changed = True
+            if description and inv_item.description != description:
+                inv_item.description = description
+                changed = True
+            if changed:
+                inv_item.save()
+                updated_count += 1
+
+    if created_count or updated_count:
+        log_fn(f"  [Inventory] created={created_count}, updated={updated_count}")
+        _add_journal_entry(
+            device,
+            f"Discovery synchronized inventory items: created={created_count}, updated={updated_count}.",
+        )
 
 
 # ---------------------------------------------------------------------------
