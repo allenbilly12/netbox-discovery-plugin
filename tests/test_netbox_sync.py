@@ -143,3 +143,64 @@ class SyncVrfsTests(unittest.TestCase):
         self.assertEqual(rows[1].name, "Blue")
         self.assertEqual(rows[1].rd, "")
         self.assertTrue(any("Skipping RD '65000:99' for VRF 'Blue'" in msg for msg in messages))
+
+
+class JournalMessageTests(unittest.TestCase):
+    def setUp(self):
+        self.netbox_sync = load_module()
+
+    def test_interface_message_ignores_prune_only_runs(self):
+        message = self.netbox_sync._build_interface_journal_message(
+            {
+                "created": 0,
+                "updated": 0,
+                "deleted": 0,
+                "deleted_names": [],
+                "delete_failed": 0,
+                "prune_skipped": True,
+            }
+        )
+
+        self.assertEqual(message, "")
+
+    def test_interface_message_includes_real_changes(self):
+        message = self.netbox_sync._build_interface_journal_message(
+            {
+                "created": 1,
+                "updated": 2,
+                "deleted": 1,
+                "deleted_names": ["Gi1/0/24"],
+                "delete_failed": 1,
+            }
+        )
+
+        self.assertIn("created=1", message)
+        self.assertIn("updated=2", message)
+        self.assertIn("deleted=1 (Gi1/0/24)", message)
+        self.assertIn("delete_failed=1", message)
+
+    def test_ip_message_ignores_conflict_only_runs(self):
+        message = self.netbox_sync._build_ip_journal_message(
+            {
+                "created": 0,
+                "reassigned": 0,
+                "conflicts": 3,
+                "mgmt_created": 0,
+            }
+        )
+
+        self.assertEqual(message, "")
+
+    def test_ip_message_includes_conflicts_when_other_changes_exist(self):
+        message = self.netbox_sync._build_ip_journal_message(
+            {
+                "created": 2,
+                "reassigned": 1,
+                "conflicts": 3,
+                "mgmt_created": 0,
+            }
+        )
+
+        self.assertIn("created=2", message)
+        self.assertIn("reassigned=1", message)
+        self.assertIn("conflicts=3", message)

@@ -311,45 +311,16 @@ def sync_device(
         interfaces_step_status = (data.get("step_status") or {}).get("interfaces")
         prune_stale = interfaces_step_status != "fail"
         interface_stats = _sync_interfaces(device, interfaces_raw, log_fn, prune_stale=prune_stale, options=options)
-        if (
-            interface_stats["created"]
-            or interface_stats["updated"]
-            or interface_stats["deleted"]
-            or interface_stats["delete_failed"]
-            or interface_stats["prune_skipped"]
-        ):
-            parts = []
-            if interface_stats["created"]:
-                parts.append(f"created={interface_stats['created']}")
-            if interface_stats["updated"]:
-                parts.append(f"updated={interface_stats['updated']}")
-            if interface_stats["deleted"]:
-                parts.append(
-                    f"deleted={interface_stats['deleted']} ({', '.join(interface_stats['deleted_names'])})"
-                )
-            if interface_stats["delete_failed"]:
-                parts.append(f"delete_failed={interface_stats['delete_failed']}")
-            if interface_stats.get("stale_count"):
-                parts.append(f"stale_detected={interface_stats['stale_count']}")
-            if interface_stats["prune_skipped"]:
-                parts.append("prune_skipped=yes (interface collection failed)")
-            _add_journal_entry(
-                device,
-                "Discovery synchronized interfaces: " + "; ".join(parts) + ".",
-            )
+        interface_journal_message = _build_interface_journal_message(interface_stats)
+        if interface_journal_message:
+            _add_journal_entry(device, interface_journal_message)
         _sync_lag_members(device, lag_members, log_fn)
 
         # --- IP Addresses ---
         primary_ip, ip_stats = _sync_ips(device, interfaces_ip, mgmt_ip, log_fn)
-        if ip_stats["created"] or ip_stats["reassigned"] or ip_stats["conflicts"] or ip_stats["mgmt_created"]:
-            _add_journal_entry(
-                device,
-                (
-                    "Discovery synchronized IP assignments: "
-                    f"created={ip_stats['created']}, reassigned={ip_stats['reassigned']}, "
-                    f"conflicts={ip_stats['conflicts']}, mgmt_created={ip_stats['mgmt_created']}."
-                ),
-            )
+        ip_journal_message = _build_ip_journal_message(ip_stats)
+        if ip_journal_message:
+            _add_journal_entry(device, ip_journal_message)
 
         # --- Set primary IP ---
         existing_primary = device.primary_ip4
@@ -371,14 +342,6 @@ def sync_device(
             log_fn(
                 f"  Preserving existing primary IPv4 {existing_primary} on '{hostname}' "
                 f"(candidate from discovery was {primary_ip})."
-            )
-            _add_journal_entry(
-                device,
-                (
-                    "Discovery preserved existing primary IPv4 "
-                    f"{existing_primary}; discovered candidate {primary_ip} was ignored "
-                    "because the current primary still exists on the device."
-                ),
             )
             primary_ip = existing_primary
 
@@ -1019,16 +982,6 @@ def _sync_lag_members(device, lag_members: Dict[str, List[str]], log_fn: Callabl
                 f"on {device.name} because it is no longer reported as a member."
             ),
         )
-
-    if unresolved_members:
-        unique_missing = sorted(set(unresolved_members))
-        _add_journal_entry(
-            device,
-            "Discovery skipped unresolved LAG members to avoid duplicate interface creation: "
-            + ", ".join(unique_missing)
-            + ".",
-        )
-
 
 def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
     from dcim.models import Interface
@@ -1795,6 +1748,49 @@ def _journal_kind_info():
     except Exception:
         pass
     return "info"
+
+
+def _build_interface_journal_message(interface_stats: Dict[str, Any]) -> str:
+    """Return a journal message only when interface state actually changed."""
+    if not (
+        interface_stats.get("created")
+        or interface_stats.get("updated")
+        or interface_stats.get("deleted")
+    ):
+        return ""
+
+    parts = []
+    if interface_stats.get("created"):
+        parts.append(f"created={interface_stats['created']}")
+    if interface_stats.get("updated"):
+        parts.append(f"updated={interface_stats['updated']}")
+    if interface_stats.get("deleted"):
+        deleted_names = interface_stats.get("deleted_names") or []
+        parts.append(f"deleted={interface_stats['deleted']} ({', '.join(deleted_names)})")
+    if interface_stats.get("delete_failed"):
+        parts.append(f"delete_failed={interface_stats['delete_failed']}")
+
+    return "Discovery synchronized interfaces: " + "; ".join(parts) + "."
+
+
+def _build_ip_journal_message(ip_stats: Dict[str, int]) -> str:
+    """Return a journal message only when IP ownership actually changed."""
+    if not (
+        ip_stats.get("created")
+        or ip_stats.get("reassigned")
+        or ip_stats.get("mgmt_created")
+    ):
+        return ""
+
+    parts = [
+        f"created={ip_stats.get('created', 0)}",
+        f"reassigned={ip_stats.get('reassigned', 0)}",
+        f"mgmt_created={ip_stats.get('mgmt_created', 0)}",
+    ]
+    if ip_stats.get("conflicts"):
+        parts.append(f"conflicts={ip_stats['conflicts']}")
+
+    return "Discovery synchronized IP assignments: " + ", ".join(parts) + "."
 
 
 def _add_journal_entry(obj, message: str) -> bool:
