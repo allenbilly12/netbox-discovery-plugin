@@ -1,25 +1,27 @@
 # netbox-discovery
 
-A NetBox 4.x community plugin that automatically discovers network devices using
-IP addresses and CIDR ranges, crawls CDP/LLDP neighbors, and populates NetBox with
-device facts, interfaces, IP addresses, and VLANs.
+A NetBox 4.x community plugin that discovers network devices from seed IPs and
+CIDR ranges, walks CDP/LLDP neighbors, and syncs the results into NetBox.
+It collects device facts, interfaces, L3 addressing, VLANs, stack members, and
+optionally VRFs and inventory items.
 
 ---
 
 ## Features
 
-- **Seed-based discovery**: Provide IP addresses or CIDR ranges as starting points
-- **ICMP ping sweep**: Finds live hosts before attempting NAPALM connections
-- **NAPALM integration**: Collects device facts (hostname, vendor, model, serial, OS version),
-  all interfaces, L3 IP addresses (including VLAN SVIs), and VLAN lists
-- **CDP/LLDP neighbor crawling**: Recursively discovers adjacent devices up to a configurable depth
-- **Safe NetBox sync**: Uses `get_or_create` everywhere — **never deletes** existing records
-- **"Holding" site**: Newly discovered devices are placed in a configurable holding site
-- **Existing device detection**: Matches by hostname first, then by management IP
-- **Scheduled runs**: Built-in periodic job scheduler (configurable per-target interval)
-- **Manual runs**: "Run Now" button in the GUI
-- **Full NetBox GUI**: List/detail/edit views integrated into NetBox navigation
-- **REST API**: Full CRUD API plus `POST /targets/{id}/run/` to trigger jobs
+- **Seed-based discovery**: Start from individual IPs or CIDR ranges
+- **TCP host discovery**: Uses `nmap` when available and falls back to a pure-Python TCP probe
+- **Recursive neighbor crawling**: Follows CDP and/or LLDP neighbors up to a configurable depth
+- **NAPALM auto-detection**: Tries `ios → nxos_ssh → junos → fortios → eos`
+- **Device sync**: Creates or updates manufacturers, device types, devices, interfaces, IPs, VLANs, and stack membership
+- **Optional enrichment**: Can also sync platform, interface speed, FQDN, prefixes, VRFs, and inventory items
+- **Duplicate-aware matching**: Matches by hostname, management IP, and base-hostname domain variants
+- **Holding site workflow**: New devices land in a configurable holding site, then can be auto-assigned by hostname prefix
+- **Stale interface cleanup**: Removes interfaces that are no longer reported when interface collection succeeds
+- **Conflict logging**: Writes IP assignment conflicts to a dedicated log file for follow-up
+- **Duplicate device tools**: Includes a UI for reviewing, merging, and deleting domain-variant duplicates
+- **Built-in scheduling**: Manual runs plus recurring runs via the background scheduler
+- **NetBox UI + API**: CRUD views plus `POST /api/plugins/discovery/targets/{id}/run/`
 
 ---
 
@@ -27,7 +29,10 @@ device facts, interfaces, IP addresses, and VLANs.
 
 - NetBox 4.0+
 - Python 3.10+
-- `nmap` binary installed on the NetBox server (for ping sweep)
+- `nmap` binary recommended for faster host discovery
+
+If `nmap` or `python-nmap` is unavailable, the plugin falls back to a threaded
+TCP connect probe.
 
 ---
 
@@ -91,6 +96,19 @@ PLUGINS_CONFIG = {
         'default_username': '',
         'default_password': '',
         'default_enable_secret': '',
+
+        # Default conflict log path
+        'conflict_log_path': '/var/log/netbox/discovery_conflicts.log',
+
+        # Tier 1 sync options (enabled by default)
+        'sync_platform': True,
+        'sync_interface_speed': True,
+        'sync_fqdn': True,
+        'create_prefixes': False,
+
+        # Tier 2 collection options (disabled by default)
+        'collect_vrfs': False,
+        'collect_inventory': False,
     }
 }
 ```
@@ -118,10 +136,13 @@ sudo systemctl restart netbox netbox-rq
 3. Fill in:
    - **Name**: A descriptive label
    - **Targets**: One IP address or CIDR range per line (e.g., `10.0.0.1`, `192.168.1.0/24`)
+   - **Exclusions**: IPs or CIDRs to omit from scanning
    - **Credentials**: SSH username/password (or leave blank to use global defaults)
-   - **NAPALM Driver**: `Auto-detect` tries Cisco IOS → NX-OS → EOS → JunOS → FortiOS
+   - **NAPALM Driver**: `Auto-detect` tries Cisco IOS → NX-OS → JunOS → FortiOS → EOS
    - **Discovery Protocol**: LLDP, CDP, or Both
    - **Max Depth**: How many neighbor hops to follow (default: 3)
+   - **SSH Timeout**: Per-device connection timeout
+   - **Max Workers**: Number of devices crawled in parallel
    - **Auto-run Interval**: Minutes between automatic runs (0 = manual only)
 4. Click **Save**
 
@@ -139,7 +160,15 @@ The built-in scheduler checks every 5 minutes and enqueues jobs for due targets.
 - **Run History**: Plugins → Network Discovery → Run History
 - Each run shows: hosts scanned, devices created/updated, error count, and full log output
 - Discovered devices appear in **Devices** with site set to the holding site
-- Interfaces, IPs, and VLANs are created/updated on each device
+- Interfaces, IPs, VLANs, stack members, and optional enrichment data are synchronized on each device
+
+### Managing Duplicate Devices
+
+Use **Plugins → Network Discovery → Duplicate Devices** to review devices that
+share the same base hostname with different domain suffixes. From there you can:
+
+- Merge a duplicate into the keeper device while preserving useful metadata, IPs, and connections
+- Delete an unwanted duplicate directly from the plugin UI
 
 ---
 
@@ -147,18 +176,30 @@ The built-in scheduler checks every 5 minutes and enqueues jobs for due targets.
 
 | NAPALM data | NetBox object |
 |-------------|---------------|
-| `get_facts()` → hostname, vendor, model, serial | `dcim.Device`, `dcim.DeviceType`, `dcim.Manufacturer` |
-| `get_interfaces()` → name, enabled, description, MTU | `dcim.Interface` |
+| `get_facts()` → hostname, vendor, model, serial, OS version | `dcim.Device`, `dcim.DeviceType`, `dcim.Manufacturer`, custom fields |
+| `get_interfaces()` → name, enabled, description, MTU, speed | `dcim.Interface` |
 | `get_interfaces_ip()` → IP/prefix per interface | `ipam.IPAddress` (assigned to interface) |
-| `get_vlans()` → VID, name | `ipam.VLAN` (scoped to holding site) |
+| `get_vlans()` → VID, name | `ipam.VLAN` (scoped to the device's resolved site) |
+| Cisco stack data | `dcim.VirtualChassis` plus member `dcim.Device` records |
+| Optional `get_network_instances()` data | `ipam.VRF` |
+| Optional `show inventory` data | `dcim.InventoryItem` |
 | Management IP (seed IP) | `dcim.Device.primary_ip4` |
 
-### Matching logic (no deletions)
+### Matching logic
 
 1. Check for existing `Device` with the same **hostname**
 2. If not found, check for existing `IPAddress` with the management IP and follow its assignment
-3. If not found, create a new device in the holding site
-4. On match: update `device_type`, `serial`, and any changed interface/IP data
+3. If not found, check for a device with the same base hostname and a different domain suffix
+4. If not found, create a new device in the holding site
+5. On match: update device attributes and synchronized data
+
+### Sync behavior and safeguards
+
+- Discovery updates existing devices instead of replacing them wholesale
+- Primary IP conflicts are logged and domain-variant blockers can be auto-resolved
+- Interface cleanup is conservative: stale interfaces are pruned only when interface collection succeeds
+- Existing tags and user-managed data are preserved where possible
+- Prefix creation, VRF collection, and inventory collection are opt-in
 
 ---
 
@@ -168,9 +209,9 @@ The built-in scheduler checks every 5 minutes and enqueues jobs for due targets.
 |--------|------------|
 | `ios` | Cisco IOS / IOS-XE |
 | `nxos_ssh` | Cisco NX-OS |
-| `eos` | Arista EOS |
 | `junos` | Juniper JunOS |
 | `fortios` | Fortinet FortiOS |
+| `eos` | Arista EOS |
 
 Auto-detect tries them in the order above (Cisco-first).
 
@@ -203,6 +244,13 @@ All endpoints are under `/api/plugins/discovery/`.
 | `default_username` | `""` | Fallback SSH username |
 | `default_password` | `""` | Fallback SSH password |
 | `default_enable_secret` | `""` | Fallback enable password |
+| `conflict_log_path` | `"/var/log/netbox/discovery_conflicts.log"` | Default path used for the dedicated IP conflict log |
+| `sync_platform` | `True` | Set the NetBox device platform from the selected NAPALM driver |
+| `sync_interface_speed` | `True` | Sync interface speed from NAPALM data |
+| `sync_fqdn` | `True` | Store device FQDN in a custom field when available |
+| `create_prefixes` | `False` | Create Prefix records from discovered interface addressing |
+| `collect_vrfs` | `False` | Run `get_network_instances()` and sync VRFs |
+| `collect_inventory` | `False` | Run inventory collection and sync inventory items |
 
 ---
 
@@ -216,10 +264,19 @@ All endpoints are under `/api/plugins/discovery/`.
 - Verify `nmap` is installed: `which nmap`
 - Test manually: `napalm --user admin --password secret --vendor ios get_facts <ip>`
 - Check SSH reachability from the NetBox server
+- If a driver library is missing, the run log will mark it unavailable and skip future attempts in that process
 
 **Wrong interfaces types?**
 - Interface type is auto-detected from the interface name
 - You can manually update types in NetBox after discovery
+
+**Seeing many unreachable neighbor IPs?**
+- Prefer CDP/LLDP management addresses where available
+- Use target exclusions to prevent known non-manageable subnets from being scanned
+
+**Need to investigate IP conflicts?**
+- Review the main run log for warnings
+- Check `/var/log/netbox/discovery_conflicts.log`
 
 ---
 
