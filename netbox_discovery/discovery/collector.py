@@ -330,6 +330,16 @@ def _get_cdp_via_cli(device, driver_name: str) -> List[Dict]:
     return neighbors
 
 
+def _is_valid_neighbor_ipv4(value: str) -> bool:
+    """Return True when *value* is a valid IPv4 address."""
+    try:
+        import ipaddress
+
+        return isinstance(ipaddress.ip_address(value), ipaddress.IPv4Address)
+    except Exception:
+        return False
+
+
 def _collect_lag_members(device, driver_name: str) -> Dict[str, List[str]]:
     """
     Best-effort collection of LAG/port-channel membership via device CLI.
@@ -566,13 +576,32 @@ def _parse_cdp_neighbors(output: str) -> List[Dict]:
     """
     neighbors = []
     current = {}
+    in_management_addresses = False
+
+    def finalize(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not entry:
+            return None
+
+        management_ips = entry.pop("_management_ips", [])
+        candidate_ips = entry.pop("_candidate_ips", [])
+
+        for ip_list in (management_ips, candidate_ips):
+            for candidate in ip_list:
+                if _is_valid_neighbor_ipv4(candidate):
+                    entry["remote_ip"] = candidate
+                    return entry
+
+        entry["remote_ip"] = ""
+        return entry
 
     for line in output.splitlines():
         line = line.strip()
 
         if line.startswith("Device ID:") or line.startswith("Device ID :"):
             if current:
-                neighbors.append(current)
+                finalized = finalize(current)
+                if finalized:
+                    neighbors.append(finalized)
             current = {
                 "source": "cdp",
                 "local_interface": "",
@@ -580,23 +609,34 @@ def _parse_cdp_neighbors(output: str) -> List[Dict]:
                 "remote_interface": "",
                 "remote_ip": "",
                 "remote_description": "",
+                "_candidate_ips": [],
+                "_management_ips": [],
             }
+            in_management_addresses = False
+        elif line.startswith("Entry address(es):") and current:
+            in_management_addresses = False
+        elif line.startswith("Management address(es):") and current:
+            in_management_addresses = True
         elif line.startswith("Interface:") and current:
             # "Interface: GigabitEthernet0/1,  Port ID (outgoing port): Gi0/0"
             parts = line.split(",")
             current["local_interface"] = parts[0].split(":", 1)[-1].strip()
             if len(parts) > 1 and "Port ID" in parts[1]:
                 current["remote_interface"] = parts[1].split(":")[-1].strip()
-        elif line.startswith("IP address:") and current:
-            current["remote_ip"] = line.split(":", 1)[-1].strip()
-        elif line.startswith("IP Address:") and current:
-            current["remote_ip"] = line.split(":", 1)[-1].strip()
+        elif current and line.lower().startswith(("ip address:", "ipv4 address:")):
+            ip_value = line.split(":", 1)[-1].strip()
+            if in_management_addresses:
+                current["_management_ips"].append(ip_value)
+            else:
+                current["_candidate_ips"].append(ip_value)
         elif line.startswith("Platform:") and current:
             # "Platform: cisco WS-C2960, ..."
             platform_part = line.split(":", 1)[-1].split(",")[0].strip()
             current["remote_description"] = platform_part
 
     if current:
-        neighbors.append(current)
+        finalized = finalize(current)
+        if finalized:
+            neighbors.append(finalized)
 
     return neighbors

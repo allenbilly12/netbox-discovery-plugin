@@ -10,6 +10,7 @@ default HTTP socket timeout of 60 s) cannot stall the crawl.
 """
 
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Callable, Optional, Tuple
 
@@ -26,6 +27,26 @@ _GARBAGE_HOSTNAMES = {
     "kernel", "localhost", "linux", "ubuntu", "debian", "centos", "redhat",
     "router", "switch", "firewall",
 }
+_UNAVAILABLE_DRIVERS = set()
+_UNAVAILABLE_DRIVERS_LOCK = threading.Lock()
+
+
+def _is_driver_available(driver_name: str) -> bool:
+    with _UNAVAILABLE_DRIVERS_LOCK:
+        return driver_name not in _UNAVAILABLE_DRIVERS
+
+
+def _mark_driver_unavailable(driver_name: str, exc: Exception, log_fn: Callable) -> None:
+    with _UNAVAILABLE_DRIVERS_LOCK:
+        first_notice = driver_name not in _UNAVAILABLE_DRIVERS
+        _UNAVAILABLE_DRIVERS.add(driver_name)
+
+    if first_notice:
+        log_fn(
+            f"    Driver '{driver_name}' unavailable in this environment: {exc}. "
+            "Skipping future attempts."
+        )
+        logger.warning("NAPALM driver '%s' unavailable: %s", driver_name, exc)
 
 
 def _looks_like_ip(s: str) -> bool:
@@ -117,6 +138,10 @@ def _try_driver(
 
         return device
 
+    except (ImportError, ModuleNotFoundError) as exc:
+        _mark_driver_unavailable(driver_name, exc, log_fn)
+        return None
+
     except Exception as exc:
         # Log at INFO so errors appear in the run log, not just system logger
         log_fn(f"    Driver '{driver_name}' failed: {type(exc).__name__}: {exc}")
@@ -199,7 +224,15 @@ def detect_and_connect(
     if preferred_driver and preferred_driver != "auto":
         drivers_to_try = [preferred_driver]
     else:
-        drivers_to_try = DETECTION_ORDER
+        drivers_to_try = [driver for driver in DETECTION_ORDER if _is_driver_available(driver)]
+
+    if preferred_driver and preferred_driver != "auto" and not _is_driver_available(preferred_driver):
+        log_fn(f"  [SKIP] Driver '{preferred_driver}' is unavailable in this environment")
+        return None, None
+
+    if not drivers_to_try:
+        log_fn(f"  [FAILED] No usable NAPALM drivers are available for {ip}")
+        return None, None
 
     log_fn(f"  Trying drivers {drivers_to_try} for {ip} (user={username})")
 
