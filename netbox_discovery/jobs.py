@@ -98,12 +98,19 @@ class DiscoveryJob(JobRunner):
             started_at=timezone.now(),
         )
 
-        holding_site = settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get(
-            "holding_site_name", "Holding"
-        )
-        ssh_timeout = target.ssh_timeout or settings.PLUGINS_CONFIG.get(
-            "netbox_discovery", {}
-        ).get("ssh_timeout", 10)
+        plugin_config = settings.PLUGINS_CONFIG.get("netbox_discovery", {})
+        holding_site = plugin_config.get("holding_site_name", "Holding")
+        ssh_timeout = target.ssh_timeout or plugin_config.get("ssh_timeout", 10)
+
+        # Build options dict for collector and sync
+        discovery_options = {
+            "sync_platform": plugin_config.get("sync_platform", True),
+            "sync_interface_speed": plugin_config.get("sync_interface_speed", True),
+            "sync_fqdn": plugin_config.get("sync_fqdn", True),
+            "create_prefixes": plugin_config.get("create_prefixes", False),
+            "collect_vrfs": plugin_config.get("collect_vrfs", False),
+            "collect_inventory": plugin_config.get("collect_inventory", False),
+        }
 
         counters = {
             "hosts_scanned": 0,
@@ -183,6 +190,7 @@ class DiscoveryJob(JobRunner):
                         data=device_data,
                         holding_site_name=holding_site,
                         log_fn=_log,
+                        options=discovery_options,
                     )
                     with log_lock:
                         status = "created" if was_created else "updated"
@@ -235,6 +243,7 @@ class DiscoveryJob(JobRunner):
                 log_fn=log_fn,
                 log_batch_fn=log_batch,
                 max_workers=target.max_workers,
+                options=discovery_options,
             )
             counters["errors"] += crawl_summary.get("failed", 0)
 

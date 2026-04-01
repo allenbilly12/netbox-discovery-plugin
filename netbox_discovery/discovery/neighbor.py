@@ -77,6 +77,7 @@ def crawl(
     log_batch_fn: Optional[Callable[[List[str]], None]] = None,
     stop_flag: Optional[Callable[[], bool]] = None,
     max_workers: int = 5,
+    options: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Concurrent BFS crawl starting from seed_ips, following LLDP/CDP neighbors.
@@ -107,15 +108,23 @@ def crawl(
         log_fn = lambda msg: logger.info(msg)
     if stop_flag is None:
         stop_flag = lambda: False
+    if options is None:
+        options = {}
 
     # Per-device data-collection wall-clock timeout.
-    # The collector runs 5 sequential NAPALM calls (get_facts, get_interfaces,
+    # The collector runs 5 base sequential NAPALM calls (get_facts, get_interfaces,
     # get_interfaces_ip, get_vlans, neighbors).  Each call may take up to
     # read_timeout seconds (max(timeout*3, 60) for most drivers).  On large
     # devices (e.g. 3850 stacks with 144 ports), show interfaces alone can
     # take 30-50s.  Allow enough room for all calls plus CDP CLI parsing.
+    # Optional Tier 2 calls add to the budget.
     read_timeout = max(timeout * 3, 60)
-    collect_timeout = read_timeout * 5 + 30  # 5 calls + 30s headroom
+    base_calls = 5
+    optional_calls = sum(1 for k in ("collect_vrfs",) if options.get(k))
+    # collect_inventory uses CLI (not a separate NAPALM getter) so it's faster
+    if options.get("collect_inventory"):
+        optional_calls += 1
+    collect_timeout = read_timeout * (base_calls + optional_calls) + 30
 
     # Thread-safe work queue; each item is (ip, depth) or None (poison pill).
     work_queue: _queue_mod.Queue = _queue_mod.Queue()
@@ -259,7 +268,7 @@ def crawl(
                         executor = ThreadPoolExecutor(max_workers=1)
                         collect_started_at = time.monotonic()
                         future = executor.submit(
-                            collect_device_data, device, driver_name, discovery_protocol, device_log
+                            collect_device_data, device, driver_name, discovery_protocol, device_log, options
                         )
                         try:
                             data = future.result(timeout=collect_timeout)
@@ -284,15 +293,20 @@ def crawl(
                         hostname = facts.get("hostname", ip)
                         discovered_hostname = hostname
                         step_status = data.get("step_status", {}) or {}
-                        step_status_summary = (
-                            f"facts={step_status.get('facts', 'n/a')} "
-                            f"interfaces={step_status.get('interfaces', 'n/a')} "
-                            f"lag={step_status.get('lag', 'n/a')} "
-                            f"ips={step_status.get('interfaces_ip', 'n/a')} "
-                            f"vlans={step_status.get('vlans', 'n/a')} "
-                            f"neighbors={step_status.get('neighbors', 'n/a')} "
-                            f"stack={step_status.get('stack', 'n/a')}"
-                        )
+                        status_parts = [
+                            f"facts={step_status.get('facts', 'n/a')}",
+                            f"interfaces={step_status.get('interfaces', 'n/a')}",
+                            f"lag={step_status.get('lag', 'n/a')}",
+                            f"ips={step_status.get('interfaces_ip', 'n/a')}",
+                            f"vlans={step_status.get('vlans', 'n/a')}",
+                            f"neighbors={step_status.get('neighbors', 'n/a')}",
+                            f"stack={step_status.get('stack', 'n/a')}",
+                        ]
+                        if "vrfs" in step_status:
+                            status_parts.append(f"vrfs={step_status['vrfs']}")
+                        if "inventory" in step_status:
+                            status_parts.append(f"inventory={step_status['inventory']}")
+                        step_status_summary = " ".join(status_parts)
                         device_log(
                             f"  Hostname: {hostname} | Vendor: {facts.get('vendor', '?')} "
                             f"| Model: {facts.get('model', '?')} | Serial: {facts.get('serial_number', '?')}"
