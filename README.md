@@ -116,7 +116,8 @@ PLUGINS_CONFIG = {
 ### 5. Run database migrations
 
 ```bash
-python manage.py migrate netbox_discovery
+cd /opt/netbox-discovery-plugin
+sudo /opt/netbox/venv/bin/python /opt/netbox/netbox/manage.py migrate netbox_discovery
 ```
 
 ### 6. Restart NetBox and workers
