@@ -29,8 +29,9 @@ Main entry point. Called once per device from `jobs.py`'s `on_device` callback.
    - If blocker is a **domain-variant** (same base hostname): auto-resolve by clearing blocker's primary IP.
    - Otherwise: log WARNING to conflict file and skip.
 11. **VLANs** — `_sync_vlans()`: `get_or_create` each VLAN scoped to holding site.
-12. **Virtual Chassis** — `_sync_virtual_chassis()`: if `stack_members > 1`, create/update VC + member devices.
-13. **Journal entries** — whenever discovery changes a `Device` (create, attributes, tags, interface sync summary, IP sync summary, primary IP changes/conflict auto-resolution, stack membership/member updates), a device journal entry is written.
+12. **VRFs** — `_sync_vrfs()`: creates VRFs from `get_network_instances()` when enabled. Placeholder route distinguishers like `0:0` are ignored, duplicate existing VRF names are tolerated by reusing the first match, and conflicting RDs are skipped with warnings instead of aborting the device sync.
+13. **Virtual Chassis** — `_sync_virtual_chassis()`: if `stack_members > 1`, create/update VC + member devices.
+14. **Journal entries** — whenever discovery changes a `Device` (create, attributes, tags, interface sync summary, IP sync summary, primary IP changes/conflict auto-resolution, stack membership/member updates), a device journal entry is written.
 
 ---
 

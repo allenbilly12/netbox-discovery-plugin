@@ -1461,6 +1461,8 @@ def _sync_vrfs(vrfs_raw: Dict, log_fn: Callable):
     from ipam.models import VRF
 
     created_count = 0
+    updated_count = 0
+    warning_count = 0
     for vrf_name, vrf_data in vrfs_raw.items():
         if not vrf_name or vrf_name.lower() in ("default", "global"):
             continue
@@ -1468,18 +1470,68 @@ def _sync_vrfs(vrfs_raw: Dict, log_fn: Callable):
         state = vrf_data.get("state", {})
         if isinstance(state, dict):
             rd = state.get("route_distinguisher", "") or ""
-        defaults = {}
-        if rd:
-            defaults["rd"] = rd
-        _, created = VRF.objects.get_or_create(
-            name=vrf_name,
-            defaults=defaults,
-        )
-        if created:
+
+        rd = str(rd).strip()
+        rd_is_placeholder = rd.lower() in {"", "0:0", "0:0:0", "none", "n/a", "na"}
+
+        matching_vrfs = VRF.objects.filter(name__iexact=vrf_name)
+        matching_count = matching_vrfs.count()
+        vrf = matching_vrfs.first()
+        if matching_count > 1:
+            warning_count += 1
+            log_fn(
+                f"  [WARN] Found {matching_count} existing VRFs named '{vrf_name}'; "
+                f"using VRF id={vrf.pk}."
+            )
+
+        if vrf is None:
+            create_kwargs = {"name": vrf_name}
+            if rd and not rd_is_placeholder:
+                conflicting_rd_vrf = VRF.objects.filter(rd=rd).first()
+                if conflicting_rd_vrf is None:
+                    create_kwargs["rd"] = rd
+                else:
+                    warning_count += 1
+                    log_fn(
+                        f"  [WARN] Skipping RD '{rd}' for VRF '{vrf_name}' because it is "
+                        f"already used by VRF '{conflicting_rd_vrf.name}' (id={conflicting_rd_vrf.pk})."
+                    )
+            vrf = VRF.objects.create(**create_kwargs)
             created_count += 1
+            continue
+
+        if not rd or rd_is_placeholder:
+            continue
+
+        if (vrf.rd or "").strip() == rd:
+            continue
+
+        conflicting_rd_vrf = VRF.objects.filter(rd=rd).exclude(pk=vrf.pk).first()
+        if conflicting_rd_vrf is not None:
+            warning_count += 1
+            log_fn(
+                f"  [WARN] Leaving RD unchanged for VRF '{vrf_name}' because RD '{rd}' is "
+                f"already used by VRF '{conflicting_rd_vrf.name}' (id={conflicting_rd_vrf.pk})."
+            )
+            continue
+
+        if not (vrf.rd or "").strip():
+            vrf.rd = rd
+            vrf.save()
+            updated_count += 1
+        else:
+            warning_count += 1
+            log_fn(
+                f"  [WARN] Leaving existing RD '{vrf.rd}' on VRF '{vrf_name}' instead of "
+                f"overwriting it with '{rd}'."
+            )
 
     if created_count:
         log_fn(f"  [VRF] Created {created_count} VRF(s)")
+    if updated_count:
+        log_fn(f"  [VRF] Updated {updated_count} VRF(s)")
+    if warning_count:
+        log_fn(f"  [WARN] VRF sync had {warning_count} warning(s)")
 
 
 def _sync_inventory_items(device, items: List[Dict], log_fn: Callable):
