@@ -1409,7 +1409,23 @@ def _sync_platform(device, driver_name: str, manufacturer, log_fn: Callable):
 def _sync_prefixes(interfaces_ip: Dict, site, log_fn: Callable):
     """Create Prefix records from interface IP/prefix pairs (Tier 1.4)."""
     import netaddr
+    from django.contrib.contenttypes.models import ContentType
     from ipam.models import Prefix
+
+    prefix_field_names = {field.name for field in Prefix._meta.get_fields()}
+
+    prefix_scope_defaults = {}
+    if site is not None:
+        if "scope_type" in prefix_field_names and "scope_id" in prefix_field_names:
+            prefix_scope_defaults["scope_type"] = ContentType.objects.get_for_model(
+                site,
+                for_concrete_model=False,
+            )
+            prefix_scope_defaults["scope_id"] = site.pk
+        elif "scope" in prefix_field_names:
+            prefix_scope_defaults["scope"] = site
+        elif "site" in prefix_field_names:
+            prefix_scope_defaults["site"] = site
 
     created_count = 0
     error_count = 0
@@ -1424,16 +1440,17 @@ def _sync_prefixes(interfaces_ip: Dict, site, log_fn: Callable):
                     continue
                 try:
                     network = netaddr.IPNetwork(f"{ip_str}/{prefix_len}")
-                    if network.ip.is_link_local() or network.ip.is_loopback():
-                        continue
-                    cidr = str(network.cidr)
-                    defaults = {"status": "active"}
-                    if site is not None:
-                        # NetBox 4.2+ uses a generic scope field instead of Prefix.site.
-                        if hasattr(Prefix, "scope"):
-                            defaults["scope"] = site
-                        elif hasattr(Prefix, "site"):
-                            defaults["site"] = site
+                except Exception as exc:
+                    error_count += 1
+                    log_fn(f"  [WARN] Invalid prefix candidate {ip_str}/{prefix_len}: {exc}")
+                    continue
+
+                if network.ip.is_link_local() or network.ip.is_loopback():
+                    continue
+
+                cidr = str(network.cidr)
+                defaults = {"status": "active", **prefix_scope_defaults}
+                try:
                     _, created = Prefix.objects.get_or_create(
                         prefix=cidr,
                         defaults=defaults,
@@ -1442,13 +1459,12 @@ def _sync_prefixes(interfaces_ip: Dict, site, log_fn: Callable):
                         created_count += 1
                 except Exception as exc:
                     error_count += 1
-                    log_fn(f"  [WARN] Failed to sync prefix {ip_str}/{prefix_len}: {exc}")
-                    continue
+                    log_fn(f"  [ERROR] Failed to sync prefix {cidr}: {exc}")
 
     if created_count:
         log_fn(f"  [Prefix] Created {created_count} prefix(es)")
     if error_count:
-        log_fn(f"  [WARN] Prefix sync had {error_count} error(s)")
+        log_fn(f"  [ERROR] Prefix sync encountered {error_count} error(s)")
 
 
 def _sync_vrfs(vrfs_raw: Dict, log_fn: Callable):
