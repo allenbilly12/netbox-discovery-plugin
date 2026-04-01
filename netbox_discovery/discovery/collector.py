@@ -540,31 +540,50 @@ def _parse_inventory_output(output: str, driver_name: str) -> List[Dict]:
     """
     items = []
     name_re = re.compile(r'NAME:\s*"([^"]+)"(?:,\s*DESCR:\s*"([^"]*)")?', re.IGNORECASE)
-    pid_sn_re = re.compile(r"PID:\s*(\S+)\s*,.*SN:\s*(\S+)", re.IGNORECASE)
+    pid_re = re.compile(r"PID:\s*([^,]*)", re.IGNORECASE)
+    sn_re = re.compile(r"SN:\s*([^,\s]*)", re.IGNORECASE)
 
     current_name = None
     current_descr = ""
+    current_pid = ""
+    current_sn = ""
+
+    def flush_current() -> None:
+        nonlocal current_name, current_descr, current_pid, current_sn
+        if current_name is None:
+            return
+
+        # Keep peripheral entries even when PID/SN are blank; many PSU/fan
+        # records omit one of those fields but are still useful in NetBox.
+        items.append({
+            "name": current_name,
+            "pid": current_pid,
+            "serial": current_sn,
+            "description": current_descr,
+        })
+        current_name = None
+        current_descr = ""
+        current_pid = ""
+        current_sn = ""
 
     for line in output.splitlines():
         nm = name_re.search(line)
         if nm:
+            flush_current()
             current_name = nm.group(1).strip()
             current_descr = (nm.group(2) or "").strip()
             continue
 
         if current_name is not None:
-            pm = pid_sn_re.search(line)
-            if pm:
-                pid = pm.group(1).strip()
-                sn = pm.group(2).strip()
-                items.append({
-                    "name": current_name,
-                    "pid": pid,
-                    "serial": sn,
-                    "description": current_descr,
-                })
-                current_name = None
-                current_descr = ""
+            pid_match = pid_re.search(line)
+            if pid_match:
+                current_pid = pid_match.group(1).strip()
+
+            sn_match = sn_re.search(line)
+            if sn_match:
+                current_sn = sn_match.group(1).strip()
+
+    flush_current()
 
     return items
 

@@ -54,3 +54,47 @@ Interface: GigabitEthernet1/0/2,  Port ID (outgoing port): Gi0/1
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParseInventoryOutputTests(unittest.TestCase):
+    def setUp(self):
+        self.collector = load_module()
+
+    def test_keeps_multiple_cisco_inventory_entries(self):
+        output = """
+NAME: "Chassis", DESCR: "Cisco C8500 Chassis"
+PID: C8500L-8S4X    , VID: V01, SN: FLX263604LE
+
+NAME: "module R0", DESCR: "Route Processor"
+PID: C8500-RP       , VID: V01, SN: FOC12345678
+
+NAME: "Power Supply Module 0", DESCR: "Cisco 650W AC Power Supply"
+PID: PWR-650WAC-R   , VID: V01, SN: DCA12345678
+"""
+
+        parsed = self.collector._parse_inventory_output(output, "ios")
+
+        self.assertEqual([item["name"] for item in parsed], [
+            "Chassis",
+            "module R0",
+            "Power Supply Module 0",
+        ])
+
+    def test_keeps_entries_when_pid_or_serial_is_blank(self):
+        output = """
+NAME: "Power Supply Module 1", DESCR: "Cisco 650W AC Power Supply"
+PID:                 , VID: V01, SN:
+
+NAME: "Fan Tray", DESCR: "Fan Tray"
+PID: FAN-TRAY-1      , VID: V01, SN:
+"""
+
+        parsed = self.collector._parse_inventory_output(output, "ios")
+
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0]["name"], "Power Supply Module 1")
+        self.assertEqual(parsed[0]["pid"], "")
+        self.assertEqual(parsed[0]["serial"], "")
+        self.assertEqual(parsed[1]["name"], "Fan Tray")
+        self.assertEqual(parsed[1]["pid"], "FAN-TRAY-1")
+        self.assertEqual(parsed[1]["serial"], "")
