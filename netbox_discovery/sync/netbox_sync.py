@@ -357,9 +357,11 @@ def sync_device(
             and existing_primary
             and existing_primary != primary_ip
             and existing_primary_present
+            and _should_preserve_existing_primary(existing_primary, primary_ip)
         ):
             # Preserve user-selected/stable primary IP as long as it still
-            # exists on this device. Only change when it is no longer present.
+            # exists on this device. Allow a discovered management-interface
+            # IP to replace an older non-management primary.
             log_fn(
                 f"  Preserving existing primary IPv4 {existing_primary} on '{hostname}' "
                 f"(candidate from discovery was {primary_ip})."
@@ -1113,6 +1115,29 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
                 stats["mgmt_created"] += 1
 
     return primary_ip, stats
+
+
+def _should_preserve_existing_primary(existing_primary, candidate_primary) -> bool:
+    """
+    Preserve an existing primary IP unless discovery found a management
+    interface IP and the current primary is not on a management port.
+    """
+    if existing_primary is None or candidate_primary is None:
+        return False
+
+    existing_iface = getattr(existing_primary, "assigned_object", None)
+    candidate_iface = getattr(candidate_primary, "assigned_object", None)
+    existing_iface_name = getattr(existing_iface, "name", "")
+    candidate_iface_name = getattr(candidate_iface, "name", "")
+
+    if (
+        candidate_iface_name
+        and _is_management_interface_name(candidate_iface_name)
+        and not _is_management_interface_name(existing_iface_name)
+    ):
+        return False
+
+    return True
 
 
 def _is_existing_primary_present_on_device(device, interfaces_ip: Dict) -> bool:

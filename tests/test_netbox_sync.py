@@ -411,3 +411,30 @@ class SyncIpsTests(unittest.TestCase):
 
         self.assertIsNotNone(primary_ip)
         self.assertEqual(primary_ip.address, "198.51.100.10/24")
+
+
+class PrimaryPreservationTests(unittest.TestCase):
+    def setUp(self):
+        self.netbox_sync = load_module()
+
+    def test_management_candidate_overrides_non_management_primary(self):
+        device = types.SimpleNamespace(pk=1, name="edge-01")
+        existing_iface = FakeInterface(pk=1, device=device, name="Loopback255")
+        candidate_iface = FakeInterface(pk=2, device=device, name="GigabitEthernet0/0")
+        existing_primary = FakeIPAddress(pk=1, address="192.168.1.1/32", assigned_object=existing_iface)
+        candidate_primary = FakeIPAddress(pk=2, address="10.10.10.10/24", assigned_object=candidate_iface)
+
+        self.assertFalse(
+            self.netbox_sync._should_preserve_existing_primary(existing_primary, candidate_primary)
+        )
+
+    def test_preserves_existing_primary_when_candidate_is_not_management(self):
+        device = types.SimpleNamespace(pk=1, name="edge-01")
+        existing_iface = FakeInterface(pk=1, device=device, name="Loopback255")
+        candidate_iface = FakeInterface(pk=2, device=device, name="Vlan10")
+        existing_primary = FakeIPAddress(pk=1, address="192.168.1.1/32", assigned_object=existing_iface)
+        candidate_primary = FakeIPAddress(pk=2, address="10.10.10.10/24", assigned_object=candidate_iface)
+
+        self.assertTrue(
+            self.netbox_sync._should_preserve_existing_primary(existing_primary, candidate_primary)
+        )
