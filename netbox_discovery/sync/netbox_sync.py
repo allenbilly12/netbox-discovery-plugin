@@ -83,6 +83,27 @@ def map_interface_type(name: str) -> str:
     return "other"
 
 
+def _is_management_interface_name(name: str) -> bool:
+    """Return True when the interface name looks like a management port."""
+    normalized = _canonical_interface_name(name).lower()
+    return (
+        normalized.startswith("mgmt")
+        or normalized.startswith("management")
+        or normalized == "gigabitethernet0/0"
+    )
+
+
+def _preferred_management_interface_ip(interfaces_ip: Dict) -> str:
+    """Return the preferred IPv4 from a management interface when present."""
+    for iface_name, addr_families in (interfaces_ip or {}).items():
+        if not _is_management_interface_name(iface_name):
+            continue
+        for ip_str in ((addr_families or {}).get("ipv4") or {}).keys():
+            if ip_str:
+                return ip_str
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Slug helpers
 # ---------------------------------------------------------------------------
@@ -989,6 +1010,7 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
     from django.contrib.contenttypes.models import ContentType
 
     iface_ct = ContentType.objects.get_for_model(Interface)
+    preferred_primary_ip = _preferred_management_interface_ip(interfaces_ip) or mgmt_ip
     primary_ip = None
     stats = {
         "created": 0,
@@ -1067,7 +1089,7 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
                     stats["reassigned"] += 1
 
                 # Track which IP is the management IP for setting as primary
-                if ip_str == mgmt_ip:
+                if family == "ipv4" and ip_str == preferred_primary_ip:
                     primary_ip = ip_obj
 
     # If no exact match for mgmt_ip, create a /32 for it

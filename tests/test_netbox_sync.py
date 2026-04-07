@@ -204,3 +204,210 @@ class JournalMessageTests(unittest.TestCase):
         self.assertIn("created=2", message)
         self.assertIn("reassigned=1", message)
         self.assertIn("conflicts=3", message)
+
+
+class FakeInterface:
+    objects = None
+
+    def __init__(self, pk, device, name, enabled=True, type="1000base-t"):
+        self.pk = pk
+        self.device = device
+        self.name = name
+        self.enabled = enabled
+        self.type = type
+        self.saved = False
+
+    def save(self):
+        self.saved = True
+
+
+class FakeInterfaceManager:
+    def __init__(self, rows):
+        self.rows = rows
+        self.next_pk = max((row.pk for row in rows), default=0) + 1
+
+    def filter(self, **criteria):
+        results = []
+        for row in self.rows:
+            matched = True
+            for key, expected in criteria.items():
+                actual = getattr(row, key, None)
+                if key == "name":
+                    matched = str(actual).lower() == str(expected).lower()
+                else:
+                    matched = actual == expected
+                if not matched:
+                    break
+            if matched:
+                results.append(row)
+        return FakeQuerySet(results)
+
+    def get_or_create(self, **kwargs):
+        defaults = kwargs.pop("defaults", {})
+        existing = self.filter(**kwargs).first()
+        if existing:
+            return existing, False
+        row = FakeInterface(pk=self.next_pk, **kwargs, **defaults)
+        self.next_pk += 1
+        self.rows.append(row)
+        return row, True
+
+
+class FakeIPAddress:
+    objects = None
+
+    def __init__(
+        self,
+        pk,
+        address,
+        assigned_object=None,
+        status="active",
+        assigned_object_type=None,
+        assigned_object_id=None,
+    ):
+        self.pk = pk
+        self.address = address
+        self.assigned_object = assigned_object
+        self.status = status
+        self.assigned_object_type = assigned_object_type
+        self.assigned_object_type_id = getattr(assigned_object_type, "id", None)
+        self.assigned_object_id = (
+            assigned_object_id if assigned_object_id is not None else getattr(assigned_object, "pk", None)
+        )
+        self.saved = False
+
+    def save(self):
+        self.saved = True
+
+
+class FakeIPAddressManager:
+    def __init__(self, rows):
+        self.rows = rows
+        self.next_pk = max((row.pk for row in rows), default=0) + 1
+
+    def filter(self, **criteria):
+        return FakeQuerySet([row for row in self.rows if _matches(row, criteria)])
+
+    def get_or_create(self, address, defaults=None):
+        defaults = defaults or {}
+        existing = self.filter(address=address).first()
+        if existing:
+            return existing, False
+
+        assigned_object = None
+        assigned_object_id = defaults.get("assigned_object_id")
+        if assigned_object_id is not None:
+            assigned_object = next(
+                (row for row in FakeInterface.objects.rows if row.pk == assigned_object_id),
+                None,
+            )
+        row = FakeIPAddress(
+            pk=self.next_pk,
+            address=address,
+            assigned_object=assigned_object,
+            status=defaults.get("status", "active"),
+            assigned_object_type=defaults.get("assigned_object_type"),
+            assigned_object_id=assigned_object_id,
+        )
+        self.next_pk += 1
+        self.rows.append(row)
+        return row, True
+
+
+class SyncIpsTests(unittest.TestCase):
+    def setUp(self):
+        self.netbox_sync = load_module()
+
+    def _run_sync_ips(self, interface_names, interfaces_ip, mgmt_ip):
+        device = types.SimpleNamespace(pk=1, name="edge-01")
+        iface_rows = [
+            FakeInterface(pk=index, device=device, name=iface_name)
+            for index, iface_name in enumerate(interface_names, start=1)
+        ]
+        ip_rows = []
+        FakeInterface.objects = FakeInterfaceManager(iface_rows)
+        FakeIPAddress.objects = FakeIPAddressManager(ip_rows)
+
+        fake_dcim = types.ModuleType("dcim")
+        fake_dcim_models = types.ModuleType("dcim.models")
+        fake_dcim_models.Interface = FakeInterface
+
+        fake_ipam = types.ModuleType("ipam")
+        fake_ipam_models = types.ModuleType("ipam.models")
+        fake_ipam_models.IPAddress = FakeIPAddress
+
+        fake_django = types.ModuleType("django")
+        fake_contrib = types.ModuleType("django.contrib")
+        fake_contenttypes = types.ModuleType("django.contrib.contenttypes")
+        fake_contenttypes_models = types.ModuleType("django.contrib.contenttypes.models")
+
+        class FakeContentType:
+            id = 42
+
+        class FakeContentTypeManager:
+            @staticmethod
+            def get_for_model(_model):
+                return FakeContentType()
+
+        fake_contenttypes_models.ContentType = types.SimpleNamespace(objects=FakeContentTypeManager())
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "dcim": fake_dcim,
+                "dcim.models": fake_dcim_models,
+                "ipam": fake_ipam,
+                "ipam.models": fake_ipam_models,
+                "django": fake_django,
+                "django.contrib": fake_contrib,
+                "django.contrib.contenttypes": fake_contenttypes,
+                "django.contrib.contenttypes.models": fake_contenttypes_models,
+            },
+        ):
+            return self.netbox_sync._sync_ips(
+                device,
+                interfaces_ip,
+                mgmt_ip=mgmt_ip,
+                log_fn=lambda _msg: None,
+            )
+
+    def test_prefers_active_management_interface_ip_over_seed_ip(self):
+        primary_ip, stats = self._run_sync_ips(
+            ["Management1", "GigabitEthernet1/0/1"],
+            {
+                "GigabitEthernet1/0/1": {"ipv4": {"10.0.0.10": {"prefix_length": 24}}},
+                "Management1": {"ipv4": {"192.0.2.10": {"prefix_length": 24}}},
+            },
+            mgmt_ip="10.0.0.10",
+        )
+
+        self.assertIsNotNone(primary_ip)
+        self.assertEqual(primary_ip.address, "192.0.2.10/24")
+        self.assertEqual(stats["created"], 2)
+        self.assertEqual(stats["mgmt_created"], 0)
+
+    def test_treats_catalyst_gigabitethernet0_0_as_management_interface(self):
+        primary_ip, _stats = self._run_sync_ips(
+            ["GigabitEthernet0/0", "GigabitEthernet1/0/1"],
+            {
+                "GigabitEthernet0/0": {"ipv4": {"192.0.2.10": {"prefix_length": 24}}},
+                "GigabitEthernet1/0/1": {"ipv4": {"10.0.0.10": {"prefix_length": 24}}},
+            },
+            mgmt_ip="10.0.0.10",
+        )
+
+        self.assertIsNotNone(primary_ip)
+        self.assertEqual(primary_ip.address, "192.0.2.10/24")
+
+    def test_treats_nexus_mgmt0_as_management_interface(self):
+        primary_ip, _stats = self._run_sync_ips(
+            ["mgmt0", "Ethernet1/1"],
+            {
+                "mgmt0": {"ipv4": {"198.51.100.10": {"prefix_length": 24}}},
+                "Ethernet1/1": {"ipv4": {"10.0.0.10": {"prefix_length": 24}}},
+            },
+            mgmt_ip="10.0.0.10",
+        )
+
+        self.assertIsNotNone(primary_ip)
+        self.assertEqual(primary_ip.address, "198.51.100.10/24")

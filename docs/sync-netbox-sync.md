@@ -98,3 +98,7 @@ IP conflicts that cannot be auto-resolved are written to `/var/log/netbox/discov
 - **Change cable sync behaviour**: Edit `sync_cables()` — the `frozenset` dedup and `cable_id` skip are the two idempotency guards.
 - **Add a new device classification rule**: Add a tuple to `_RULES` in `sync/classify.py`. Pattern order matters — specific patterns before generic ones. Each rule is `(regex_pattern, role_name, [tag_slugs])`.
 - **Add a new vendor for driver-based fallback**: Add to `DRIVER_ROLE_FALLBACK` and `DRIVER_VENDOR_TAG` dicts in `sync/classify.py`.
+# netbox_sync.py
+
+- Primary IPv4 selection now prefers an active IPv4 assigned to a management interface (`mgmt*`, `management*`, Nexus `mgmt0`, or Catalyst `GigabitEthernet0/0`) when one is present on the device.
+- If no management-interface IPv4 is available, sync falls back to the discovered seed management IP and finally to creating a `/32` for that seed IP as before.
