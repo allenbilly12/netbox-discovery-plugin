@@ -448,7 +448,7 @@ def sync_device(
         if options.get("collect_vrfs", False):
             vrfs_raw = data.get("vrfs", {})
             if vrfs_raw:
-                _sync_vrfs(vrfs_raw, log_fn)
+                _sync_vrfs(vrfs_raw, device, log_fn)
 
         # --- Inventory Items (Tier 2.2) ---
         if options.get("collect_inventory", False):
@@ -1456,13 +1456,18 @@ def _sync_prefixes(interfaces_ip: Dict, site, log_fn: Callable):
         log_fn(f"  [WARN] Prefix sync had {error_count} error(s)")
 
 
-def _sync_vrfs(vrfs_raw: Dict, log_fn: Callable):
+def _sync_vrfs(vrfs_raw: Dict, device, log_fn: Callable):
     """Create VRF records from get_network_instances() data (Tier 2.1)."""
-    from ipam.models import VRF
+    from ipam.models import RouteTarget, VRF
 
     created_count = 0
     updated_count = 0
     warning_count = 0
+    rt_created_count = 0
+    rt_linked_count = 0
+    iface_linked_count = 0
+    ip_linked_count = 0
+
     for vrf_name, vrf_data in vrfs_raw.items():
         if not vrf_name or vrf_name.lower() in ("default", "global"):
             continue
@@ -1498,40 +1503,123 @@ def _sync_vrfs(vrfs_raw: Dict, log_fn: Callable):
                     )
             vrf = VRF.objects.create(**create_kwargs)
             created_count += 1
-            continue
-
-        if not rd or rd_is_placeholder:
-            continue
-
-        if (vrf.rd or "").strip() == rd:
-            continue
-
-        conflicting_rd_vrf = VRF.objects.filter(rd=rd).exclude(pk=vrf.pk).first()
-        if conflicting_rd_vrf is not None:
-            warning_count += 1
-            log_fn(
-                f"  [WARN] Leaving RD unchanged for VRF '{vrf_name}' because RD '{rd}' is "
-                f"already used by VRF '{conflicting_rd_vrf.name}' (id={conflicting_rd_vrf.pk})."
-            )
-            continue
-
-        if not (vrf.rd or "").strip():
-            vrf.rd = rd
-            vrf.save()
-            updated_count += 1
         else:
-            warning_count += 1
-            log_fn(
-                f"  [WARN] Leaving existing RD '{vrf.rd}' on VRF '{vrf_name}' instead of "
-                f"overwriting it with '{rd}'."
-            )
+            if rd and not rd_is_placeholder and (vrf.rd or "").strip() != rd:
+                conflicting_rd_vrf = VRF.objects.filter(rd=rd).exclude(pk=vrf.pk).first()
+                if conflicting_rd_vrf is not None:
+                    warning_count += 1
+                    log_fn(
+                        f"  [WARN] Leaving RD unchanged for VRF '{vrf_name}' because RD '{rd}' is "
+                        f"already used by VRF '{conflicting_rd_vrf.name}' (id={conflicting_rd_vrf.pk})."
+                    )
+                elif not (vrf.rd or "").strip():
+                    vrf.rd = rd
+                    vrf.save()
+                    updated_count += 1
+                else:
+                    warning_count += 1
+                    log_fn(
+                        f"  [WARN] Leaving existing RD '{vrf.rd}' on VRF '{vrf_name}' instead of "
+                        f"overwriting it with '{rd}'."
+                    )
+
+        rt_data = vrf_data.get("route_targets", {})
+        if rt_data:
+            new_created, new_linked = _sync_vrf_route_targets(vrf, rt_data, RouteTarget, log_fn)
+            rt_created_count += new_created
+            rt_linked_count += new_linked
+
+        iface_names = list(
+            (vrf_data.get("interfaces") or {}).get("interface", {}).keys()
+        )
+        if iface_names and device is not None:
+            new_ifaces, new_ips = _assign_vrf_interfaces(vrf, iface_names, device)
+            iface_linked_count += new_ifaces
+            ip_linked_count += new_ips
 
     if created_count:
         log_fn(f"  [VRF] Created {created_count} VRF(s)")
     if updated_count:
         log_fn(f"  [VRF] Updated {updated_count} VRF(s)")
+    if rt_created_count:
+        log_fn(f"  [VRF] Created {rt_created_count} route target(s)")
+    if rt_linked_count:
+        log_fn(f"  [VRF] Linked {rt_linked_count} route target association(s)")
+    if iface_linked_count:
+        log_fn(f"  [VRF] Assigned {iface_linked_count} interface(s) to VRF(s)")
+    if ip_linked_count:
+        log_fn(f"  [VRF] Assigned {ip_linked_count} IP address(es) to VRF(s)")
     if warning_count:
         log_fn(f"  [WARN] VRF sync had {warning_count} warning(s)")
+
+
+def _sync_vrf_route_targets(vrf, rt_data: Dict, RouteTarget, log_fn: Callable):
+    """
+    Create RouteTarget objects and link them to a VRF's import/export M2M fields.
+    RouteTarget is passed in to allow test injection.
+    Returns (created_count, linked_count).
+    """
+    created_count = 0
+    linked_count = 0
+
+    for direction in ("import", "export"):
+        rt_names = rt_data.get(direction, [])
+        if not rt_names:
+            continue
+        m2m = getattr(vrf, f"{direction}_targets")
+        existing_pks = set(m2m.values_list("pk", flat=True))
+        for rt_name in rt_names:
+            rt_name = rt_name.strip()
+            if not rt_name:
+                continue
+            rt, created = RouteTarget.objects.get_or_create(name=rt_name)
+            if created:
+                created_count += 1
+            if rt.pk not in existing_pks:
+                m2m.add(rt)
+                linked_count += 1
+                existing_pks.add(rt.pk)
+
+    return created_count, linked_count
+
+
+def _assign_vrf_interfaces(vrf, iface_names: List[str], device) -> tuple:
+    """
+    Set Interface.vrf and IPAddress.vrf for every interface listed in the
+    NAPALM get_network_instances() data.  Only overwrites a None/blank vrf
+    field — never reassigns an interface already in a different VRF.
+    Returns (interfaces_assigned, ips_assigned).
+    """
+    from dcim.models import Interface
+    from django.contrib.contenttypes.models import ContentType
+    from ipam.models import IPAddress
+
+    iface_ct = ContentType.objects.get_for_model(Interface)
+    ifaces_assigned = 0
+    ips_assigned = 0
+
+    for iface_name in iface_names:
+        iface = _find_interface(device, iface_name)
+        if iface is None:
+            continue
+
+        if iface.vrf_id != vrf.pk:
+            if iface.vrf_id is None:
+                iface.vrf = vrf
+                iface.save()
+                ifaces_assigned += 1
+            # If already in a different VRF, leave it alone — don't overwrite.
+
+        for ip_obj in IPAddress.objects.filter(
+            assigned_object_type=iface_ct,
+            assigned_object_id=iface.pk,
+        ):
+            if ip_obj.vrf_id is None:
+                ip_obj.vrf = vrf
+                ip_obj.save()
+                ips_assigned += 1
+
+    return ifaces_assigned, ips_assigned
 
 
 def _sync_inventory_items(device, items: List[Dict], log_fn: Callable):

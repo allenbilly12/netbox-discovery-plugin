@@ -57,6 +57,23 @@ class FakeQuerySet(list):
         return len(self)
 
 
+class FakeM2MManager:
+    def __init__(self):
+        self._items = []
+
+    def values_list(self, field, flat=False):
+        return [getattr(item, field) for item in self._items]
+
+    def add(self, item):
+        self._items.append(item)
+
+    def filter(self, **criteria):
+        return FakeQuerySet([obj for obj in self._items if _matches(obj, criteria)])
+
+    def all(self):
+        return list(self._items)
+
+
 class FakeVRF:
     objects = None
 
@@ -65,6 +82,8 @@ class FakeVRF:
         self.name = name
         self.rd = rd
         self.save_calls = 0
+        self.import_targets = FakeM2MManager()
+        self.export_targets = FakeM2MManager()
 
     def save(self):
         self.save_calls += 1
@@ -85,21 +104,80 @@ class FakeVRFManager:
         return row
 
 
+class FakeRouteTarget:
+    objects = None
+
+    def __init__(self, pk, name):
+        self.pk = pk
+        self.name = name
+
+
+class FakeRouteTargetManager:
+    def __init__(self):
+        self.store = {}
+        self.next_pk = 1
+
+    def get_or_create(self, name):
+        if name in self.store:
+            return self.store[name], False
+        rt = FakeRouteTarget(pk=self.next_pk, name=name)
+        self.next_pk += 1
+        self.store[name] = rt
+        return rt, True
+
+
+_FAKE_IFACE_CT = object()  # sentinel — acts as the Interface ContentType
+
+
+class FakeContentTypeManager:
+    def get_for_model(self, model):
+        return _FAKE_IFACE_CT
+
+
+class FakeContentType:
+    objects = FakeContentTypeManager()
+
+
+class FakeDevice:
+    def __init__(self, pk=1, name="test-device"):
+        self.pk = pk
+        self.name = name
+
+
 class SyncVrfsTests(unittest.TestCase):
     def setUp(self):
         self.netbox_sync = load_module()
 
-    def _run_sync(self, rows, vrfs_raw):
+    def _run_sync(self, rows, vrfs_raw, device=None, iface_rows=None, ip_rows=None):
         manager = FakeVRFManager(rows)
         FakeVRF.objects = manager
+        rt_manager = FakeRouteTargetManager()
+        FakeRouteTarget.objects = rt_manager
+        FakeInterface.objects = FakeInterfaceManager(iface_rows or [])
+        FakeIPAddress.objects = FakeIPAddressManager(ip_rows or [])
 
+        fake_dcim = types.ModuleType("dcim")
+        fake_dcim_models = types.ModuleType("dcim.models")
+        fake_dcim_models.Interface = FakeInterface
         fake_ipam = types.ModuleType("ipam")
         fake_ipam_models = types.ModuleType("ipam.models")
         fake_ipam_models.VRF = FakeVRF
+        fake_ipam_models.RouteTarget = FakeRouteTarget
+        fake_ipam_models.IPAddress = FakeIPAddress
+        fake_ct = types.ModuleType("django.contrib.contenttypes")
+        fake_ct_models = types.ModuleType("django.contrib.contenttypes.models")
+        fake_ct_models.ContentType = FakeContentType
         messages = []
 
-        with mock.patch.dict(sys.modules, {"ipam": fake_ipam, "ipam.models": fake_ipam_models}):
-            self.netbox_sync._sync_vrfs(vrfs_raw, messages.append)
+        with mock.patch.dict(sys.modules, {
+            "dcim": fake_dcim,
+            "dcim.models": fake_dcim_models,
+            "ipam": fake_ipam,
+            "ipam.models": fake_ipam_models,
+            "django.contrib.contenttypes": fake_ct,
+            "django.contrib.contenttypes.models": fake_ct_models,
+        }):
+            self.netbox_sync._sync_vrfs(vrfs_raw, device, messages.append)
 
         return messages
 
@@ -143,6 +221,168 @@ class SyncVrfsTests(unittest.TestCase):
         self.assertEqual(rows[1].name, "Blue")
         self.assertEqual(rows[1].rd, "")
         self.assertTrue(any("Skipping RD '65000:99' for VRF 'Blue'" in msg for msg in messages))
+
+    def test_creates_route_targets_and_links_to_new_vrf(self):
+        rows = []
+
+        messages = self._run_sync(
+            rows,
+            {
+                "BLUE": {
+                    "state": {"route_distinguisher": "65000:100"},
+                    "route_targets": {
+                        "import": ["65000:100", "65000:200"],
+                        "export": ["65000:100"],
+                    },
+                }
+            },
+        )
+
+        vrf = rows[0]
+        self.assertEqual(vrf.name, "BLUE")
+        self.assertEqual([rt.name for rt in vrf.import_targets.all()], ["65000:100", "65000:200"])
+        self.assertEqual([rt.name for rt in vrf.export_targets.all()], ["65000:100"])
+        self.assertTrue(any("route target" in msg for msg in messages))
+
+    def test_links_route_targets_to_existing_vrf(self):
+        existing = FakeVRF(pk=1, name="RED", rd="65000:10")
+        rows = [existing]
+
+        self._run_sync(
+            rows,
+            {
+                "RED": {
+                    "state": {"route_distinguisher": "65000:10"},
+                    "route_targets": {
+                        "import": ["65000:10"],
+                        "export": ["65000:10"],
+                    },
+                }
+            },
+        )
+
+        self.assertEqual([rt.name for rt in existing.import_targets.all()], ["65000:10"])
+        self.assertEqual([rt.name for rt in existing.export_targets.all()], ["65000:10"])
+
+    def test_does_not_duplicate_already_linked_route_target(self):
+        existing = FakeVRF(pk=1, name="GREEN", rd="65000:50")
+        rows = [existing]
+        vrf_data = {
+            "GREEN": {
+                "state": {"route_distinguisher": "65000:50"},
+                "route_targets": {"import": ["65000:50"], "export": []},
+            }
+        }
+
+        self._run_sync(rows, vrf_data)
+        self.assertEqual(len(existing.import_targets.all()), 1)
+
+        self._run_sync(rows, vrf_data)
+        self.assertEqual(len(existing.import_targets.all()), 1)
+
+    def test_no_route_targets_when_key_absent(self):
+        rows = []
+
+        self._run_sync(
+            rows,
+            {"PLAIN": {"state": {"route_distinguisher": "65000:1"}}},
+        )
+
+        vrf = rows[0]
+        self.assertEqual(vrf.import_targets.all(), [])
+        self.assertEqual(vrf.export_targets.all(), [])
+
+    def test_assigns_interface_to_vrf(self):
+        device = FakeDevice()
+        iface = FakeInterface(pk=10, name="Loopback0", device=device, vrf=None, vrf_id=None)
+        rows = []
+
+        messages = self._run_sync(
+            rows,
+            {
+                "BLUE": {
+                    "state": {"route_distinguisher": "65000:100"},
+                    "interfaces": {"interface": {"Loopback0": {}}},
+                }
+            },
+            device=device,
+            iface_rows=[iface],
+        )
+
+        vrf = rows[0]
+        self.assertIs(iface.vrf, vrf)
+        self.assertEqual(iface.save_calls, 1)
+        self.assertTrue(any("interface" in msg for msg in messages))
+
+    def test_assigns_ip_to_vrf_via_interface(self):
+        device = FakeDevice()
+        iface = FakeInterface(pk=10, name="Loopback0", device=device, vrf=None, vrf_id=None)
+        ip = FakeIPAddress(
+            pk=20,
+            address="10.0.0.1/32",
+            assigned_object_type=_FAKE_IFACE_CT,
+            assigned_object_id=10,
+            vrf=None,
+            vrf_id=None,
+        )
+        rows = []
+
+        self._run_sync(
+            rows,
+            {
+                "BLUE": {
+                    "state": {"route_distinguisher": "65000:100"},
+                    "interfaces": {"interface": {"Loopback0": {}}},
+                }
+            },
+            device=device,
+            iface_rows=[iface],
+            ip_rows=[ip],
+        )
+
+        vrf = rows[0]
+        self.assertIs(ip.vrf, vrf)
+        self.assertEqual(ip.save_calls, 1)
+
+    def test_does_not_overwrite_interface_already_in_different_vrf(self):
+        device = FakeDevice()
+        other_vrf = FakeVRF(pk=99, name="OTHER")
+        iface = FakeInterface(pk=10, name="Loopback0", device=device, vrf=other_vrf, vrf_id=99)
+        rows = []
+
+        self._run_sync(
+            rows,
+            {
+                "BLUE": {
+                    "state": {"route_distinguisher": "65000:100"},
+                    "interfaces": {"interface": {"Loopback0": {}}},
+                }
+            },
+            device=device,
+            iface_rows=[iface],
+        )
+
+        self.assertIs(iface.vrf, other_vrf)
+        self.assertEqual(iface.save_calls, 0)
+
+    def test_skips_interface_assignment_when_device_is_none(self):
+        iface = FakeInterface(pk=10, name="Loopback0", device=None, vrf=None, vrf_id=None)
+        rows = []
+
+        self._run_sync(
+            rows,
+            {
+                "BLUE": {
+                    "state": {},
+                    "interfaces": {"interface": {"Loopback0": {}}},
+                }
+            },
+            device=None,
+            iface_rows=[iface],
+        )
+
+        self.assertIsNone(iface.vrf)
+        self.assertEqual(iface.save_calls, 0)
 
 
 class JournalMessageTests(unittest.TestCase):
@@ -209,16 +449,23 @@ class JournalMessageTests(unittest.TestCase):
 class FakeInterface:
     objects = None
 
-    def __init__(self, pk, device, name, enabled=True, type="1000base-t"):
+    def __init__(self, pk, device=None, name="", enabled=True, type="1000base-t",
+                 vrf=None, vrf_id=None):
         self.pk = pk
         self.device = device
         self.name = name
         self.enabled = enabled
         self.type = type
+        self.vrf = vrf
+        self.vrf_id = vrf_id
         self.saved = False
+        self.save_calls = 0
 
     def save(self):
         self.saved = True
+        self.save_calls += 1
+        if self.vrf is not None:
+            self.vrf_id = self.vrf.pk
 
 
 class FakeInterfaceManager:
@@ -227,20 +474,16 @@ class FakeInterfaceManager:
         self.next_pk = max((row.pk for row in rows), default=0) + 1
 
     def filter(self, **criteria):
-        results = []
+        return FakeQuerySet([row for row in self.rows if _matches(row, criteria)])
+
+    def values_list(self, *fields, flat=False):
+        result = []
         for row in self.rows:
-            matched = True
-            for key, expected in criteria.items():
-                actual = getattr(row, key, None)
-                if key == "name":
-                    matched = str(actual).lower() == str(expected).lower()
-                else:
-                    matched = actual == expected
-                if not matched:
-                    break
-            if matched:
-                results.append(row)
-        return FakeQuerySet(results)
+            if flat and len(fields) == 1:
+                result.append(getattr(row, fields[0], None))
+            else:
+                result.append(tuple(getattr(row, f, None) for f in fields))
+        return result
 
     def get_or_create(self, **kwargs):
         defaults = kwargs.pop("defaults", {})
@@ -259,11 +502,13 @@ class FakeIPAddress:
     def __init__(
         self,
         pk,
-        address,
+        address="",
         assigned_object=None,
         status="active",
         assigned_object_type=None,
         assigned_object_id=None,
+        vrf=None,
+        vrf_id=None,
     ):
         self.pk = pk
         self.address = address
@@ -274,10 +519,16 @@ class FakeIPAddress:
         self.assigned_object_id = (
             assigned_object_id if assigned_object_id is not None else getattr(assigned_object, "pk", None)
         )
+        self.vrf = vrf
+        self.vrf_id = vrf_id
         self.saved = False
+        self.save_calls = 0
 
     def save(self):
         self.saved = True
+        self.save_calls += 1
+        if self.vrf is not None:
+            self.vrf_id = self.vrf.pk
 
 
 class FakeIPAddressManager:

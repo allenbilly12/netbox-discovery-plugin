@@ -274,6 +274,11 @@ def collect_device_data(
             result["step_status"]["vrfs"] = "skip"
             log_fn(f"    [{next_step}/{STEPS}] get_network_instances() not supported ({time.monotonic()-t0:.1f}s) — skipped")
             logger.debug("get_network_instances() failed: %s", exc)
+        else:
+            rt_by_vrf = _collect_vrf_route_targets(device, driver_name)
+            for vrf_name, rt_data in rt_by_vrf.items():
+                if vrf_name in result["vrfs"]:
+                    result["vrfs"][vrf_name]["route_targets"] = rt_data
         next_step += 1
 
     # --- Inventory items via show inventory (Tier 2.2) ---
@@ -586,6 +591,101 @@ def _parse_inventory_output(output: str, driver_name: str) -> List[Dict]:
     flush_current()
 
     return items
+
+
+def _collect_vrf_route_targets(device, driver_name: str) -> Dict[str, Dict]:
+    """
+    Collect import/export route targets per VRF via CLI ('show vrf detail').
+    Supports IOS/IOS-XE and NX-OS.  Returns {} for unsupported drivers or on failure.
+    Returns {vrf_name: {"import": [rt, ...], "export": [rt, ...]}}.
+    """
+    if driver_name not in ("ios", "nxos", "nxos_ssh"):
+        return {}
+    command = "show vrf detail"
+    try:
+        output = device.cli([command]).get(command, "")
+    except Exception as exc:
+        logger.debug("Route target CLI command failed (%s): %s", command, exc)
+        return {}
+    if not output:
+        return {}
+    if driver_name == "ios":
+        return _parse_ios_vrf_route_targets(output)
+    return _parse_nxos_vrf_route_targets(output)
+
+
+def _parse_ios_vrf_route_targets(output: str) -> Dict[str, Dict]:
+    """
+    Parse 'show vrf detail' IOS/IOS-XE output into per-VRF route target lists.
+    Returns {vrf_name: {"import": [...], "export": [...]}}.
+    """
+    result: Dict[str, Dict] = {}
+    current_vrf = None
+    mode: Optional[str] = None  # "import" or "export"
+
+    for line in output.splitlines():
+        vrf_match = re.match(r"^VRF\s+(\S+)", line)
+        if vrf_match:
+            name = vrf_match.group(1).rstrip(";").strip()
+            if name.lower() not in ("default", "global"):
+                current_vrf = name
+                result.setdefault(current_vrf, {"import": [], "export": []})
+            else:
+                current_vrf = None
+            mode = None
+            continue
+
+        if current_vrf is None:
+            continue
+
+        stripped = line.strip()
+        if re.search(r"Export VPN route-target", stripped, re.IGNORECASE):
+            mode = None if stripped.lower().startswith("no ") else "export"
+        elif re.search(r"Import VPN route-target", stripped, re.IGNORECASE):
+            mode = None if stripped.lower().startswith("no ") else "import"
+        elif mode and "RT:" in line:
+            for rt in re.findall(r"RT:(\S+)", line):
+                if rt not in result[current_vrf][mode]:
+                    result[current_vrf][mode].append(rt)
+        elif mode and stripped and "RT:" not in line:
+            mode = None
+
+    return result
+
+
+def _parse_nxos_vrf_route_targets(output: str) -> Dict[str, Dict]:
+    """
+    Parse 'show vrf detail' NX-OS output into per-VRF route target lists.
+    Returns {vrf_name: {"import": [...], "export": [...]}}.
+    """
+    result: Dict[str, Dict] = {}
+    current_vrf = None
+
+    for line in output.splitlines():
+        vrf_match = re.match(r"^VRF-Name:\s*(\S+)", line, re.IGNORECASE)
+        if vrf_match:
+            name = vrf_match.group(1).rstrip(",").strip()
+            if name.lower() not in ("default", "global"):
+                current_vrf = name
+                result.setdefault(current_vrf, {"import": [], "export": []})
+            else:
+                current_vrf = None
+            continue
+
+        if current_vrf is None:
+            continue
+
+        stripped = line.strip()
+        # "RT import : 65000:100  65000:200", "RT export : 65000:100", "RT both : 65000:100"
+        for direction, keywords in (("import", ("import", "both")), ("export", ("export", "both"))):
+            pattern = r"^RT\s+(?:" + "|".join(keywords) + r")\s*:?\s*(.*)"
+            m = re.match(pattern, stripped, re.IGNORECASE)
+            if m:
+                for rt in m.group(1).split():
+                    if rt not in result[current_vrf][direction]:
+                        result[current_vrf][direction].append(rt)
+
+    return result
 
 
 def _parse_cdp_neighbors(output: str) -> List[Dict]:
