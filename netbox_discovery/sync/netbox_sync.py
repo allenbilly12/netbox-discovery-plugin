@@ -734,6 +734,12 @@ def _perform_hardware_refresh(old_device, hostname: str, new_device_type, role, 
     old_device_name = old_device.name
     old_device.status = _device_decommission_status()
     old_device.name = archive_name
+    # Clear virtual chassis membership so the replacement can claim the same
+    # vc_position — the DB unique constraint (virtual_chassis_id, vc_position)
+    # would otherwise block the new device from joining the same stack slot.
+    old_device.virtual_chassis = None
+    old_device.vc_position = None
+    old_device.vc_priority = None
     old_device.save()
 
     replacement = Device.objects.create(
