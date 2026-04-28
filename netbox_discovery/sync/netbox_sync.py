@@ -93,15 +93,28 @@ def _is_management_interface_name(name: str) -> bool:
     )
 
 
-def _preferred_management_interface_ip(interfaces_ip: Dict) -> str:
+def _preferred_management_interface_ip(interfaces_ip: Dict, interfaces_raw: Dict = None) -> str:
     """Return the preferred IPv4 from a management interface when present."""
     for iface_name, addr_families in (interfaces_ip or {}).items():
         if not _is_management_interface_name(iface_name):
+            continue
+        if _is_interface_shutdown(iface_name, interfaces_raw):
             continue
         for ip_str in ((addr_families or {}).get("ipv4") or {}).keys():
             if ip_str:
                 return ip_str
     return ""
+
+
+def _is_interface_shutdown(iface_name: str, interfaces_raw: Dict) -> bool:
+    """Return True when the interface is administratively shutdown (is_enabled=False)."""
+    if not interfaces_raw:
+        return False
+    canonical = _canonical_interface_name(iface_name)
+    for raw_name, raw_data in interfaces_raw.items():
+        if _canonical_interface_name(raw_name) == canonical:
+            return not (raw_data or {}).get("is_enabled", True)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +351,7 @@ def sync_device(
         _sync_lag_members(device, lag_members, log_fn)
 
         # --- IP Addresses ---
-        primary_ip, ip_stats = _sync_ips(device, interfaces_ip, mgmt_ip, log_fn)
+        primary_ip, ip_stats = _sync_ips(device, interfaces_ip, mgmt_ip, log_fn, interfaces_raw)
         ip_journal_message = _build_ip_journal_message(ip_stats)
         if ip_journal_message:
             _add_journal_entry(device, ip_journal_message)
@@ -1012,13 +1025,13 @@ def _sync_lag_members(device, lag_members: Dict[str, List[str]], log_fn: Callabl
             ),
         )
 
-def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
+def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable, interfaces_raw: Dict = None):
     from dcim.models import Interface
     from ipam.models import IPAddress
     from django.contrib.contenttypes.models import ContentType
 
     iface_ct = ContentType.objects.get_for_model(Interface)
-    preferred_primary_ip = _preferred_management_interface_ip(interfaces_ip) or mgmt_ip
+    preferred_primary_ip = _preferred_management_interface_ip(interfaces_ip, interfaces_raw) or mgmt_ip
     primary_ip = None
     stats = {
         "created": 0,
@@ -1096,9 +1109,11 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable):
                     ip_obj.save()
                     stats["reassigned"] += 1
 
-                # Track which IP is the management IP for setting as primary
+                # Track which IP is the management IP for setting as primary.
+                # Skip interfaces that are administratively shutdown.
                 if family == "ipv4" and ip_str == preferred_primary_ip:
-                    primary_ip = ip_obj
+                    if not _is_interface_shutdown(iface_name, interfaces_raw):
+                        primary_ip = ip_obj
 
     # If no exact match for mgmt_ip, create a /32 for it
     if primary_ip is None and mgmt_ip:

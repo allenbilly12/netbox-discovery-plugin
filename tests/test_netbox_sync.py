@@ -569,7 +569,7 @@ class SyncIpsTests(unittest.TestCase):
     def setUp(self):
         self.netbox_sync = load_module()
 
-    def _run_sync_ips(self, interface_names, interfaces_ip, mgmt_ip):
+    def _run_sync_ips(self, interface_names, interfaces_ip, mgmt_ip, interfaces_raw=None):
         device = types.SimpleNamespace(pk=1, name="edge-01")
         iface_rows = [
             FakeInterface(pk=index, device=device, name=iface_name)
@@ -620,6 +620,7 @@ class SyncIpsTests(unittest.TestCase):
                 interfaces_ip,
                 mgmt_ip=mgmt_ip,
                 log_fn=lambda _msg: None,
+                interfaces_raw=interfaces_raw,
             )
 
     def test_prefers_active_management_interface_ip_over_seed_ip(self):
@@ -662,6 +663,44 @@ class SyncIpsTests(unittest.TestCase):
 
         self.assertIsNotNone(primary_ip)
         self.assertEqual(primary_ip.address, "198.51.100.10/24")
+
+    def test_shutdown_gi0_0_not_used_as_primary(self):
+        # Gi0/0 has an IP but is administratively shutdown — should not be primary.
+        # mgmt_ip (seed) should become primary instead.
+        primary_ip, _stats = self._run_sync_ips(
+            ["GigabitEthernet0/0", "GigabitEthernet1/0/1"],
+            {
+                "GigabitEthernet0/0": {"ipv4": {"192.0.2.10": {"prefix_length": 24}}},
+                "GigabitEthernet1/0/1": {"ipv4": {"10.0.0.10": {"prefix_length": 24}}},
+            },
+            mgmt_ip="10.0.0.10",
+            interfaces_raw={
+                "GigabitEthernet0/0": {"is_enabled": False, "is_up": False},
+                "GigabitEthernet1/0/1": {"is_enabled": True, "is_up": True},
+            },
+        )
+
+        self.assertIsNotNone(primary_ip)
+        # mgmt_ip matches the 10.0.0.10/24 on GigabitEthernet1/0/1 — not the shutdown Gi0/0
+        self.assertEqual(primary_ip.address, "10.0.0.10/24")
+
+    def test_active_gi0_0_still_used_as_primary(self):
+        # Gi0/0 is enabled — should still be selected as primary.
+        primary_ip, _stats = self._run_sync_ips(
+            ["GigabitEthernet0/0", "GigabitEthernet1/0/1"],
+            {
+                "GigabitEthernet0/0": {"ipv4": {"192.0.2.10": {"prefix_length": 24}}},
+                "GigabitEthernet1/0/1": {"ipv4": {"10.0.0.10": {"prefix_length": 24}}},
+            },
+            mgmt_ip="10.0.0.10",
+            interfaces_raw={
+                "GigabitEthernet0/0": {"is_enabled": True, "is_up": True},
+                "GigabitEthernet1/0/1": {"is_enabled": True, "is_up": True},
+            },
+        )
+
+        self.assertIsNotNone(primary_ip)
+        self.assertEqual(primary_ip.address, "192.0.2.10/24")
 
 
 class PrimaryPreservationTests(unittest.TestCase):
