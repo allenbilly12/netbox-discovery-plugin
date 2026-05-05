@@ -83,6 +83,19 @@ def map_interface_type(name: str) -> str:
     return "other"
 
 
+def _normalize_mac(value) -> Optional[str]:
+    """Normalize a MAC for equality checks across str / EUI / MACAddress / None."""
+    if value is None:
+        return None
+    s = "".join(ch for ch in str(value) if ch.isalnum()).upper()
+    return s or None
+
+
+def _mac_equal(a, b) -> bool:
+    """Case- and separator-insensitive MAC equality."""
+    return _normalize_mac(a) == _normalize_mac(b)
+
+
 def _is_management_interface_name(name: str) -> bool:
     """Return True when the interface name looks like a management port."""
     normalized = _canonical_interface_name(name).lower()
@@ -810,28 +823,29 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
         if created:
             created_count += 1
 
-        changed = False
         enabled = iface_data.get("is_enabled", True)
-        description = (iface_data.get("description") or "")[:200]
+        description = ((iface_data.get("description") or "")[:200]).strip()
         mtu = iface_data.get("mtu") or None
         mac = (iface_data.get("mac_address") or "").upper() or None
 
+        changed_fields: List[str] = []
+
         if iface.type != iface_type:
             iface.type = iface_type
-            changed = True
+            changed_fields.append("type")
         if iface.enabled != enabled:
             iface.enabled = enabled
-            changed = True
-        if iface.description != description:
+            changed_fields.append("enabled")
+        if (iface.description or "").strip() != description:
             iface.description = description
-            changed = True
+            changed_fields.append("description")
         if mtu and iface.mtu != mtu:
             iface.mtu = mtu
-            changed = True
-        if mac and iface.mac_address != mac:
+            changed_fields.append("mtu")
+        if mac and not _mac_equal(iface.mac_address, mac):
             try:
                 iface.mac_address = mac
-                changed = True
+                changed_fields.append("mac_address")
             except Exception:
                 pass
 
@@ -842,12 +856,16 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
                 speed_kbps = speed_mbps * 1000
                 if iface.speed != speed_kbps:
                     iface.speed = speed_kbps
-                    changed = True
+                    changed_fields.append("speed")
 
-        if changed:
+        if changed_fields:
             iface.save()
             if not created:
                 updated_count += 1
+                log_fn(
+                    f"  [Interface] Updated {device.name}/{iface_name}: "
+                    f"{', '.join(changed_fields)}"
+                )
 
     # Only delete stale interfaces if we received a non-empty interface payload.
     # This protects against accidental mass deletions from empty collector output.
