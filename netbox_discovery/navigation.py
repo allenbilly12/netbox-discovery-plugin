@@ -26,6 +26,11 @@ menu = PluginMenu(
                     permissions=["netbox_discovery.view_discoveryrun"],
                 ),
                 PluginMenuItem(
+                    link="plugins:netbox_discovery:macaddresstableentry_list",
+                    link_text="MAC Address Table",
+                    permissions=["netbox_discovery.view_macaddresstableentry"],
+                ),
+                PluginMenuItem(
                     link="plugins:netbox_discovery:duplicate_devices",
                     link_text="Duplicate Devices",
                     permissions=["dcim.view_device"],

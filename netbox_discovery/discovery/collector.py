@@ -47,6 +47,7 @@ def collect_device_data(
 
     collect_vrfs = options.get("collect_vrfs", False)
     collect_inventory = options.get("collect_inventory", False)
+    collect_mac_address_table = options.get("collect_mac_address_table", False)
 
     result = {
         "facts": {},
@@ -75,11 +76,16 @@ def collect_device_data(
     if collect_inventory:
         result["inventory_items"] = []
         result["step_status"]["inventory"] = "pending"
+    if collect_mac_address_table:
+        result["mac_address_table"] = []
+        result["step_status"]["mac_address_table"] = "pending"
     # Dynamic step count based on enabled options
     STEPS = 7  # base: facts, interfaces, LAG, IPs, VLANs, neighbors, stack
     if collect_vrfs:
         STEPS += 1
     if collect_inventory:
+        STEPS += 1
+    if collect_mac_address_table:
         STEPS += 1
 
     # --- Facts ---
@@ -297,7 +303,63 @@ def collect_device_data(
             result["raw_errors"].append(msg)
         next_step += 1
 
+    # --- MAC address table via get_mac_address_table() (Tier 2.3) ---
+    if collect_mac_address_table:
+        log_fn(f"    [{next_step}/{STEPS}] get_mac_address_table()...")
+        t0 = time.monotonic()
+        try:
+            raw_entries = device.get_mac_address_table() or []
+            result["mac_address_table"] = _normalize_mac_table(raw_entries)
+            result["step_status"]["mac_address_table"] = "ok"
+            log_fn(
+                f"    [{next_step}/{STEPS}] get_mac_address_table() done "
+                f"({time.monotonic()-t0:.1f}s) — {len(result['mac_address_table'])} entries"
+            )
+        except Exception as exc:
+            # Many drivers don't implement get_mac_address_table(); treat as non-fatal
+            result["step_status"]["mac_address_table"] = "skip"
+            log_fn(
+                f"    [{next_step}/{STEPS}] get_mac_address_table() not supported "
+                f"({time.monotonic()-t0:.1f}s) — skipped"
+            )
+            logger.debug("get_mac_address_table() failed: %s", exc)
+        next_step += 1
+
     return result
+
+
+def _normalize_mac_table(raw_entries: List[Dict]) -> List[Dict]:
+    """
+    Filter and normalize NAPALM mac_address_table entries.
+
+    Drops entries with no MAC or no interface. Keeps a single entry per
+    (mac, vlan, interface) — NAPALM occasionally double-reports.
+    """
+    seen: set = set()
+    out: List[Dict] = []
+    for entry in raw_entries or []:
+        mac = (entry.get("mac") or "").strip()
+        iface = (entry.get("interface") or "").strip()
+        if not mac or not iface:
+            continue
+        try:
+            vlan_vid = int(entry.get("vlan") or 0)
+        except (TypeError, ValueError):
+            vlan_vid = 0
+        if vlan_vid and not (1 <= vlan_vid <= 4094):
+            vlan_vid = 0
+        key = (mac.upper(), vlan_vid, iface.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "mac": mac.upper(),
+            "interface": iface,
+            "vlan": vlan_vid,
+            "static": bool(entry.get("static", False)),
+            "active": bool(entry.get("active", True)),
+        })
+    return out
 
 
 def _extract_neighbor_ip(neighbor_data: Dict) -> str:

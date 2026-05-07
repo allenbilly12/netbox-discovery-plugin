@@ -62,6 +62,12 @@ urlpatterns = [
         views.DiscoveryRunBulkDeleteView.as_view(),
         name="discoveryrun_bulk_delete",
     ),
+    # MAC Address Table
+    path(
+        "mac-table/",
+        views.MacAddressTableEntryListView.as_view(),
+        name="macaddresstableentry_list",
+    ),
     # Duplicate Devices
     path(
         "duplicate-devices/",

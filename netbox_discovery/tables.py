@@ -1,7 +1,7 @@
 import django_tables2 as tables
 from netbox.tables import NetBoxTable, columns
 
-from .models import DiscoveryRun, DiscoveryTarget
+from .models import DiscoveryRun, DiscoveryTarget, MacAddressTableEntry
 
 
 class DiscoveryTargetTable(NetBoxTable):
@@ -91,4 +91,41 @@ class DiscoveryRunTable(NetBoxTable):
             "devices_created",
             "devices_updated",
             "errors",
+        )
+
+
+class MacAddressTableEntryTable(NetBoxTable):
+    mac_address = tables.Column(linkify=True)
+    device = tables.Column(linkify=True)
+    interface = tables.Column(linkify=True)
+    interface_name = tables.Column(verbose_name="Reported Interface")
+    vlan = tables.Column(linkify=True)
+    vlan_vid = tables.Column(verbose_name="VLAN ID")
+    is_static = columns.BooleanColumn(verbose_name="Static")
+    is_active = columns.BooleanColumn(verbose_name="Active")
+    last_seen = tables.DateTimeColumn(verbose_name="Last Seen")
+    actions = columns.ActionsColumn(actions=())
+
+    class Meta(NetBoxTable.Meta):
+        model = MacAddressTableEntry
+        fields = (
+            "pk",
+            "mac_address",
+            "device",
+            "interface",
+            "interface_name",
+            "vlan",
+            "vlan_vid",
+            "is_static",
+            "is_active",
+            "last_seen",
+            "actions",
+        )
+        default_columns = (
+            "mac_address",
+            "device",
+            "interface",
+            "vlan_vid",
+            "is_static",
+            "last_seen",
         )

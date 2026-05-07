@@ -9,7 +9,7 @@ from .choices import (
     DiscoveryProtocolChoices,
     NapalmDriverChoices,
 )
-from .models import DiscoveryTarget, DiscoveryRun
+from .models import DiscoveryTarget, DiscoveryRun, MacAddressTableEntry
 
 
 class DiscoveryTargetForm(NetBoxModelForm):
@@ -143,3 +143,15 @@ class DiscoveryRunFilterForm(NetBoxModelFilterSetForm):
 
     model = DiscoveryRun
     tag = TagFilterField(model)
+
+
+class MacAddressTableEntryFilterForm(NetBoxModelFilterSetForm):
+    """Filter form for the MAC address table list view."""
+
+    model = MacAddressTableEntry
+    tag = TagFilterField(model)
+
+    mac_address = forms.CharField(required=False, label="MAC contains")
+    device = forms.CharField(required=False, label="Device contains")
+    vlan_vid = forms.IntegerField(required=False, label="VLAN ID")
+    is_static = forms.NullBooleanField(required=False, label="Static")

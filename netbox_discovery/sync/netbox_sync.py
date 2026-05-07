@@ -466,6 +466,10 @@ def sync_device(
         # Use device.site (resolved real site) not the holding-site variable.
         _sync_vlans(vlans_raw, device.site, log_fn)
 
+        # --- Bind VLANs to interfaces (access/trunk membership) ---
+        if options.get("sync_interface_vlans", True) and vlans_raw:
+            _sync_interface_vlans(device, vlans_raw, log_fn)
+
         # --- Prefixes from interface IPs (Tier 1.4) ---
         if options.get("create_prefixes", False):
             _sync_prefixes(interfaces_ip, device.site, log_fn)
@@ -481,6 +485,13 @@ def sync_device(
             inventory_items = data.get("inventory_items", [])
             if inventory_items:
                 _sync_inventory_items(device, inventory_items, log_fn)
+
+        # --- MAC address table (Tier 2.3) ---
+        if options.get("collect_mac_address_table", False):
+            mac_entries = data.get("mac_address_table", [])
+            mac_step_status = (data.get("step_status") or {}).get("mac_address_table")
+            if mac_step_status == "ok":
+                _sync_mac_address_table(device, mac_entries, log_fn)
 
         # --- Virtual Chassis (Cisco StackWise) ---
         if len(stack_members) > 1:
@@ -1415,6 +1426,185 @@ def _sync_vlans(vlans_raw: Dict, site, log_fn: Callable):
             # Update auto-generated names with the real name
             vlan.name = vlan_name
             vlan.save()
+
+
+def _sync_interface_vlans(device, vlans_raw: Dict, log_fn: Callable) -> Dict[str, int]:
+    """
+    Bind VLANs to physical interfaces based on NAPALM get_vlans() output.
+
+    NAPALM reports each VLAN's interface members as a flat list (no tagged/untagged
+    distinction). Heuristic:
+      - interface is in exactly one VLAN  -> mode='access', untagged_vlan=that VLAN
+      - interface is in multiple VLANs    -> mode='tagged', tagged_vlans=union of those
+        (untagged_vlan is left untouched: NAPALM doesn't report the native VLAN)
+    Virtual interfaces (SVIs, loopbacks, port-channels, tunnels) are skipped: switchport
+    mode does not apply to them.
+    """
+    from dcim.models import Interface
+    from ipam.models import VLAN
+
+    stats = {"access_set": 0, "tagged_set": 0, "skipped_no_vlan": 0}
+    if not vlans_raw:
+        return stats
+
+    site = device.site
+
+    iface_to_vids: Dict[str, set] = {}
+    for vid_str, vlan_data in (vlans_raw or {}).items():
+        try:
+            vid = int(vid_str)
+        except (ValueError, TypeError):
+            continue
+        if not (1 <= vid <= 4094):
+            continue
+        for raw_iface_name in (vlan_data or {}).get("interfaces", []) or []:
+            canonical = _canonical_interface_name(raw_iface_name)
+            if not canonical:
+                continue
+            iface_to_vids.setdefault(canonical, set()).add(vid)
+
+    if not iface_to_vids:
+        return stats
+
+    vlan_by_vid: Dict[int, Any] = {}
+    needed_vids = {vid for vids in iface_to_vids.values() for vid in vids}
+    for vlan in VLAN.objects.filter(vid__in=needed_vids, site=site):
+        vlan_by_vid.setdefault(vlan.vid, vlan)
+
+    for iface_name, vids in iface_to_vids.items():
+        iface = _find_interface(device, iface_name)
+        if iface is None:
+            continue
+        if iface.type in ("virtual", "lag"):
+            # SVIs/loopbacks/tunnels and LAG parents don't carry switchport mode here.
+            # (LAG members get mode from their physical config; LAG parents are sync'd
+            # separately via NAPALM's get_vlans on the bundle in some drivers — leave
+            # them alone to avoid clobbering operator config.)
+            continue
+
+        resolved = [vlan_by_vid[v] for v in sorted(vids) if v in vlan_by_vid]
+        if not resolved:
+            stats["skipped_no_vlan"] += 1
+            continue
+
+        changed_fields: List[str] = []
+
+        if len(resolved) == 1:
+            target_vlan = resolved[0]
+            if iface.mode != "access":
+                iface.mode = "access"
+                changed_fields.append("mode->access")
+            if getattr(iface, "untagged_vlan_id", None) != target_vlan.pk:
+                iface.untagged_vlan = target_vlan
+                changed_fields.append(f"untagged_vlan->{target_vlan.vid}")
+            if changed_fields:
+                iface.save()
+                stats["access_set"] += 1
+                log_fn(
+                    f"  [VLAN] {device.name}/{iface.name} access VLAN {target_vlan.vid} "
+                    f"({', '.join(changed_fields)})."
+                )
+        else:
+            if iface.mode != "tagged":
+                iface.mode = "tagged"
+                changed_fields.append("mode->tagged")
+                iface.save()
+            current_vids = set(iface.tagged_vlans.values_list("vid", flat=True))
+            desired_vids = {v.vid for v in resolved}
+            if current_vids != desired_vids:
+                iface.tagged_vlans.set(resolved)
+                changed_fields.append(f"tagged_vlans={sorted(desired_vids)}")
+            if changed_fields:
+                stats["tagged_set"] += 1
+                log_fn(
+                    f"  [VLAN] {device.name}/{iface.name} trunk "
+                    f"({', '.join(changed_fields)})."
+                )
+
+    return stats
+
+
+def _sync_mac_address_table(device, mac_entries: List[Dict], log_fn: Callable) -> Dict[str, int]:
+    """
+    Replace this device's stored MAC address table with the latest discovery snapshot.
+
+    The table is transient (entries age out / move quickly), so we delete the previous
+    snapshot for the device in a single transaction and insert the new entries. Each
+    entry resolves an interface name to a NetBox Interface where possible, and a VLAN
+    to a NetBox VLAN at the device's site where possible.
+    """
+    from netbox_discovery.models import MacAddressTableEntry
+    from ipam.models import VLAN
+    from django.db import transaction
+
+    stats = {"inserted": 0, "removed": 0, "unresolved_interfaces": 0}
+    site = device.site
+
+    iface_cache: Dict[str, Any] = {}
+
+    def _resolve_iface(name: str):
+        key = name.lower()
+        if key in iface_cache:
+            return iface_cache[key]
+        resolved = _find_interface(device, name)
+        iface_cache[key] = resolved
+        return resolved
+
+    needed_vids = {e["vlan"] for e in mac_entries if e.get("vlan")}
+    vlan_by_vid: Dict[int, Any] = {}
+    if needed_vids:
+        for vlan in VLAN.objects.filter(vid__in=needed_vids, site=site):
+            vlan_by_vid.setdefault(vlan.vid, vlan)
+
+    rows: List[MacAddressTableEntry] = []
+    seen_keys: set = set()
+    for entry in mac_entries:
+        mac = entry.get("mac", "")
+        iface_name = entry.get("interface", "")
+        vlan_vid = entry.get("vlan") or None
+        if not mac or not iface_name:
+            continue
+
+        # The unique constraint is on (device, mac, vlan_vid, interface_name).
+        # NAPALM occasionally double-reports identical entries — dedupe before insert.
+        key = (mac, vlan_vid, iface_name.lower())
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        iface = _resolve_iface(iface_name)
+        if iface is None:
+            stats["unresolved_interfaces"] += 1
+
+        rows.append(
+            MacAddressTableEntry(
+                device=device,
+                interface=iface,
+                interface_name=iface_name,
+                mac_address=mac,
+                vlan=vlan_by_vid.get(vlan_vid) if vlan_vid else None,
+                vlan_vid=vlan_vid,
+                is_static=bool(entry.get("static", False)),
+                is_active=bool(entry.get("active", True)),
+            )
+        )
+
+    with transaction.atomic():
+        existing_qs = MacAddressTableEntry.objects.filter(device=device)
+        stats["removed"] = existing_qs.count()
+        existing_qs.delete()
+        if rows:
+            MacAddressTableEntry.objects.bulk_create(rows, batch_size=500)
+            stats["inserted"] = len(rows)
+
+    if stats["inserted"] or stats["removed"]:
+        log_fn(
+            f"  [MAC] {device.name}: {stats['inserted']} entries stored "
+            f"(replaced {stats['removed']}; "
+            f"unresolved_interfaces={stats['unresolved_interfaces']})."
+        )
+
+    return stats
 
 
 def _sync_platform(device, driver_name: str, manufacturer, log_fn: Callable):

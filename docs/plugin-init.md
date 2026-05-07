@@ -22,6 +22,14 @@ Also ensures the `os_version` custom field exists on the `Device` model after ev
 | `default_username` | `""` | Fallback SSH username |
 | `default_password` | `""` | Fallback SSH password |
 | `default_enable_secret` | `""` | Fallback enable/privilege password |
+| `sync_platform` | `True` | Map NAPALM driver → NetBox `Platform` and assign to device |
+| `sync_interface_speed` | `True` | Update `Interface.speed` from NAPALM speed reports |
+| `sync_fqdn` | `True` | Set the `fqdn` device custom field |
+| `sync_interface_vlans` | `True` | Bind discovered VLANs to interfaces (access/trunk mode + `untagged_vlan`/`tagged_vlans`) |
+| `create_prefixes` | `False` | Create `ipam.Prefix` records from interface IPs (often manually curated) |
+| `collect_vrfs` | `False` | Call `get_network_instances()` per device and sync VRFs / route targets |
+| `collect_inventory` | `False` | Run `show inventory` and sync `InventoryItem` records |
+| `collect_mac_address_table` | `False` | Call `get_mac_address_table()` per device and store entries in `MacAddressTableEntry` |
 
 ## os_version Custom Field
 

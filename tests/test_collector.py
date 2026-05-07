@@ -209,3 +209,57 @@ PID: FAN-TRAY-1      , VID: V01, SN:
         self.assertEqual(parsed[1]["name"], "Fan Tray")
         self.assertEqual(parsed[1]["pid"], "FAN-TRAY-1")
         self.assertEqual(parsed[1]["serial"], "")
+
+
+class NormalizeMacTableTests(unittest.TestCase):
+    def setUp(self):
+        self.collector = load_module()
+
+    def test_uppercases_mac_and_drops_blank_entries(self):
+        entries = [
+            {"mac": "aa:bb:cc:dd:ee:ff", "interface": "Gi0/1", "vlan": 10},
+            {"mac": "", "interface": "Gi0/2", "vlan": 10},
+            {"mac": "11:22:33:44:55:66", "interface": "", "vlan": 20},
+        ]
+
+        out = self.collector._normalize_mac_table(entries)
+
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["mac"], "AA:BB:CC:DD:EE:FF")
+        self.assertEqual(out[0]["vlan"], 10)
+        self.assertEqual(out[0]["interface"], "Gi0/1")
+
+    def test_dedupes_duplicate_entries(self):
+        entries = [
+            {"mac": "aa:bb:cc:dd:ee:ff", "interface": "Gi0/1", "vlan": 10},
+            {"mac": "AA:BB:CC:DD:EE:FF", "interface": "gi0/1", "vlan": 10},
+        ]
+
+        out = self.collector._normalize_mac_table(entries)
+
+        self.assertEqual(len(out), 1)
+
+    def test_clamps_invalid_vlan_to_zero(self):
+        entries = [
+            {"mac": "aa:bb:cc:dd:ee:ff", "interface": "Gi0/1", "vlan": 9999},
+            {"mac": "11:22:33:44:55:66", "interface": "Gi0/2", "vlan": "not-a-vlan"},
+            {"mac": "77:88:99:aa:bb:cc", "interface": "Gi0/3", "vlan": None},
+        ]
+
+        out = self.collector._normalize_mac_table(entries)
+
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[0]["vlan"], 0)
+        self.assertEqual(out[1]["vlan"], 0)
+        self.assertEqual(out[2]["vlan"], 0)
+
+    def test_preserves_static_and_active_flags(self):
+        entries = [
+            {"mac": "aa:bb:cc:dd:ee:ff", "interface": "Gi0/1", "vlan": 10,
+             "static": True, "active": False},
+        ]
+
+        out = self.collector._normalize_mac_table(entries)
+
+        self.assertTrue(out[0]["static"])
+        self.assertFalse(out[0]["active"])

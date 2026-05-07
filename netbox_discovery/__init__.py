@@ -23,10 +23,12 @@ class DiscoveryConfig(PluginConfig):
         "sync_platform": True,
         "sync_interface_speed": True,
         "sync_fqdn": True,
+        "sync_interface_vlans": True,   # bind discovered VLANs to interfaces (access/trunk)
         "create_prefixes": False,       # opt-in (prefix management often manually curated)
         # Tier 2 — opt-in (new NAPALM calls, extra time per device)
         "collect_vrfs": False,
         "collect_inventory": False,
+        "collect_mac_address_table": False,
     }
 
     required_config = []

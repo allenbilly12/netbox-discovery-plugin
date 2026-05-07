@@ -29,9 +29,11 @@ Main entry point. Called once per device from `jobs.py`'s `on_device` callback.
    - If blocker is a **domain-variant** (same base hostname): auto-resolve by clearing blocker's primary IP.
    - Otherwise: log WARNING to conflict file and skip.
 11. **VLANs** — `_sync_vlans()`: `get_or_create` each VLAN scoped to holding site.
-12. **VRFs** — `_sync_vrfs()`: creates VRFs from `get_network_instances()` when enabled. Placeholder route distinguishers like `0:0` are ignored, duplicate existing VRF names are tolerated by reusing the first match, and conflicting RDs are skipped with warnings instead of aborting the device sync.
-13. **Virtual Chassis** — `_sync_virtual_chassis()`: if `stack_members > 1`, create/update VC + member devices.
-14. **Journal entries** — discovery writes journal entries for actual object changes (for example create, attribute updates, tags added, interface/IP changes, primary IP changes, stack membership/member updates). Informational no-op cases such as preserving an existing primary IP or skipping a prune are logged to the run output only, not persisted to the device journal.
+12. **VLAN-to-interface bindings** — `_sync_interface_vlans()`: heuristically sets `Interface.mode` and `Interface.untagged_vlan` / `Interface.tagged_vlans` from NAPALM `get_vlans()` membership lists. An interface in exactly one VLAN becomes `mode='access'` with that VLAN as `untagged_vlan`; an interface in multiple VLANs becomes `mode='tagged'` with the union as `tagged_vlans` (native VLAN is left untouched — NAPALM doesn't report it). Virtual / LAG-parent interfaces are skipped. Controlled by `sync_interface_vlans` (default on).
+13. **VRFs** — `_sync_vrfs()`: creates VRFs from `get_network_instances()` when enabled. Placeholder route distinguishers like `0:0` are ignored, duplicate existing VRF names are tolerated by reusing the first match, and conflicting RDs are skipped with warnings instead of aborting the device sync.
+14. **MAC address table** — `_sync_mac_address_table()`: when `collect_mac_address_table` is enabled and NAPALM `get_mac_address_table()` succeeded, replaces the device's previous `MacAddressTableEntry` rows with the new snapshot. Each entry resolves the reported interface via `_find_interface()` (preserving the raw name in `interface_name`) and the VLAN via `(vid, site)` lookup. Unresolved interfaces / unknown VLANs leave the FK null.
+15. **Virtual Chassis** — `_sync_virtual_chassis()`: if `stack_members > 1`, create/update VC + member devices.
+16. **Journal entries** — discovery writes journal entries for actual object changes (for example create, attribute updates, tags added, interface/IP changes, primary IP changes, stack membership/member updates). Informational no-op cases such as preserving an existing primary IP or skipping a prune are logged to the run output only, not persisted to the device journal.
 
 ---
 

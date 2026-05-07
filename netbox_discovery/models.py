@@ -248,3 +248,67 @@ class DiscoveryRun(NetBoxModel):
             self.log += f"\n{message}"
         else:
             self.log = message
+
+
+class MacAddressTableEntry(NetBoxModel):
+    """
+    A single MAC address learned on a device interface.
+
+    Populated from NAPALM get_mac_address_table(). The set of entries for
+    a given device is replaced wholesale on each successful discovery run,
+    so this table reflects the device's last reported view of L2 forwarding.
+    """
+
+    device = models.ForeignKey(
+        "dcim.Device",
+        on_delete=models.CASCADE,
+        related_name="discovered_mac_entries",
+    )
+    interface = models.ForeignKey(
+        "dcim.Interface",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="discovered_mac_entries",
+    )
+    interface_name = models.CharField(
+        max_length=100,
+        help_text="Raw interface name as reported by the device (preserved for unresolved entries).",
+    )
+    mac_address = models.CharField(max_length=17, db_index=True)
+    vlan = models.ForeignKey(
+        "ipam.VLAN",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    vlan_vid = models.PositiveSmallIntegerField(null=True, blank=True, db_index=True)
+    is_static = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    last_seen = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["device", "vlan_vid", "mac_address"]
+        verbose_name = "MAC Address Table Entry"
+        verbose_name_plural = "MAC Address Table Entries"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["device", "mac_address", "vlan_vid", "interface_name"],
+                name="discovery_mac_unique",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["mac_address", "vlan_vid"]),
+        ]
+
+    def __str__(self):
+        vid = f" vlan {self.vlan_vid}" if self.vlan_vid else ""
+        return f"{self.mac_address}{vid} on {self.device}/{self.interface_name}"
+
+    def get_absolute_url(self):
+        # MAC table entries are transient and don't have their own detail page —
+        # link through to the resolved interface (or the device) instead.
+        if self.interface_id:
+            return self.interface.get_absolute_url()
+        return self.device.get_absolute_url()

@@ -446,11 +446,28 @@ class JournalMessageTests(unittest.TestCase):
         self.assertIn("conflicts=3", message)
 
 
+class FakeTaggedVlanManager:
+    """Stand-in for Interface.tagged_vlans (a NetBox-style M2M manager)."""
+
+    def __init__(self):
+        self._items = []
+
+    def values_list(self, field, flat=False):
+        return [getattr(item, field) for item in self._items]
+
+    def set(self, items):
+        self._items = list(items)
+
+    def all(self):
+        return list(self._items)
+
+
 class FakeInterface:
     objects = None
 
     def __init__(self, pk, device=None, name="", enabled=True, type="1000base-t",
-                 vrf=None, vrf_id=None):
+                 vrf=None, vrf_id=None, mode=None, untagged_vlan=None,
+                 untagged_vlan_id=None):
         self.pk = pk
         self.device = device
         self.name = name
@@ -458,6 +475,10 @@ class FakeInterface:
         self.type = type
         self.vrf = vrf
         self.vrf_id = vrf_id
+        self.mode = mode
+        self.untagged_vlan = untagged_vlan
+        self.untagged_vlan_id = untagged_vlan_id
+        self.tagged_vlans = FakeTaggedVlanManager()
         self.saved = False
         self.save_calls = 0
 
@@ -466,6 +487,8 @@ class FakeInterface:
         self.save_calls += 1
         if self.vrf is not None:
             self.vrf_id = self.vrf.pk
+        if self.untagged_vlan is not None:
+            self.untagged_vlan_id = self.untagged_vlan.pk
 
 
 class FakeInterfaceManager:
@@ -728,3 +751,169 @@ class PrimaryPreservationTests(unittest.TestCase):
         self.assertTrue(
             self.netbox_sync._should_preserve_existing_primary(existing_primary, candidate_primary)
         )
+
+
+# ---------------------------------------------------------------------------
+# VLAN-to-interface binding tests
+# ---------------------------------------------------------------------------
+
+
+class FakeVLAN:
+    objects = None
+
+    def __init__(self, pk, vid, site, name=""):
+        self.pk = pk
+        self.vid = vid
+        self.site = site
+        self.name = name
+
+
+class FakeVLANManager:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def filter(self, **criteria):
+        site = criteria.get("site")
+        vids = criteria.get("vid__in")
+        results = []
+        for row in self.rows:
+            if site is not None and row.site is not site:
+                continue
+            if vids is not None and row.vid not in set(vids):
+                continue
+            results.append(row)
+        return FakeQuerySet(results)
+
+
+class SyncInterfaceVlansTests(unittest.TestCase):
+    def setUp(self):
+        self.netbox_sync = load_module()
+
+    def _run(self, vlans_raw, iface_rows, vlan_rows, device):
+        FakeInterface.objects = FakeInterfaceManager(iface_rows)
+        FakeVLAN.objects = FakeVLANManager(vlan_rows)
+
+        fake_dcim = types.ModuleType("dcim")
+        fake_dcim_models = types.ModuleType("dcim.models")
+        fake_dcim_models.Interface = FakeInterface
+        fake_ipam = types.ModuleType("ipam")
+        fake_ipam_models = types.ModuleType("ipam.models")
+        fake_ipam_models.VLAN = FakeVLAN
+        messages = []
+
+        with mock.patch.dict(sys.modules, {
+            "dcim": fake_dcim,
+            "dcim.models": fake_dcim_models,
+            "ipam": fake_ipam,
+            "ipam.models": fake_ipam_models,
+        }):
+            stats = self.netbox_sync._sync_interface_vlans(
+                device, vlans_raw, messages.append,
+            )
+        return stats, messages
+
+    def test_single_vlan_membership_sets_access_mode(self):
+        site = types.SimpleNamespace(pk=1)
+        device = types.SimpleNamespace(pk=1, name="sw1", site=site)
+        iface = FakeInterface(pk=10, device=device, name="GigabitEthernet0/1")
+        vlan = FakeVLAN(pk=100, vid=10, site=site, name="users")
+
+        stats, _msgs = self._run(
+            {"10": {"name": "users", "interfaces": ["GigabitEthernet0/1"]}},
+            iface_rows=[iface],
+            vlan_rows=[vlan],
+            device=device,
+        )
+
+        self.assertEqual(iface.mode, "access")
+        self.assertIs(iface.untagged_vlan, vlan)
+        self.assertEqual(stats["access_set"], 1)
+        self.assertEqual(stats["tagged_set"], 0)
+        self.assertEqual(iface.save_calls, 1)
+
+    def test_multiple_vlan_membership_sets_tagged_mode(self):
+        site = types.SimpleNamespace(pk=1)
+        device = types.SimpleNamespace(pk=1, name="sw1", site=site)
+        iface = FakeInterface(pk=11, device=device, name="GigabitEthernet0/2")
+        vlan10 = FakeVLAN(pk=100, vid=10, site=site)
+        vlan20 = FakeVLAN(pk=101, vid=20, site=site)
+        vlan30 = FakeVLAN(pk=102, vid=30, site=site)
+
+        stats, _msgs = self._run(
+            {
+                "10": {"name": "v10", "interfaces": ["GigabitEthernet0/2"]},
+                "20": {"name": "v20", "interfaces": ["GigabitEthernet0/2"]},
+                "30": {"name": "v30", "interfaces": ["GigabitEthernet0/2"]},
+            },
+            iface_rows=[iface],
+            vlan_rows=[vlan10, vlan20, vlan30],
+            device=device,
+        )
+
+        self.assertEqual(iface.mode, "tagged")
+        self.assertEqual(
+            sorted(v.vid for v in iface.tagged_vlans.all()), [10, 20, 30]
+        )
+        self.assertEqual(stats["tagged_set"], 1)
+        self.assertEqual(stats["access_set"], 0)
+
+    def test_skips_virtual_and_lag_interfaces(self):
+        site = types.SimpleNamespace(pk=1)
+        device = types.SimpleNamespace(pk=1, name="sw1", site=site)
+        svi = FakeInterface(pk=200, device=device, name="Vlan10", type="virtual")
+        lag = FakeInterface(pk=201, device=device, name="Port-Channel1", type="lag")
+        vlan = FakeVLAN(pk=100, vid=10, site=site)
+
+        stats, _msgs = self._run(
+            {
+                "10": {"interfaces": ["Vlan10", "Port-Channel1"]},
+            },
+            iface_rows=[svi, lag],
+            vlan_rows=[vlan],
+            device=device,
+        )
+
+        self.assertEqual(stats["access_set"], 0)
+        self.assertEqual(stats["tagged_set"], 0)
+        self.assertEqual(svi.save_calls, 0)
+        self.assertEqual(lag.save_calls, 0)
+
+    def test_idempotent_when_already_correct(self):
+        site = types.SimpleNamespace(pk=1)
+        device = types.SimpleNamespace(pk=1, name="sw1", site=site)
+        vlan = FakeVLAN(pk=100, vid=10, site=site)
+        iface = FakeInterface(
+            pk=10,
+            device=device,
+            name="GigabitEthernet0/1",
+            mode="access",
+            untagged_vlan=vlan,
+            untagged_vlan_id=vlan.pk,
+        )
+
+        stats, _msgs = self._run(
+            {"10": {"interfaces": ["GigabitEthernet0/1"]}},
+            iface_rows=[iface],
+            vlan_rows=[vlan],
+            device=device,
+        )
+
+        self.assertEqual(iface.save_calls, 0)
+        self.assertEqual(stats["access_set"], 0)
+
+    def test_unknown_vlan_is_skipped(self):
+        site = types.SimpleNamespace(pk=1)
+        device = types.SimpleNamespace(pk=1, name="sw1", site=site)
+        iface = FakeInterface(pk=10, device=device, name="GigabitEthernet0/1")
+
+        stats, _msgs = self._run(
+            {"999": {"interfaces": ["GigabitEthernet0/1"]}},
+            iface_rows=[iface],
+            vlan_rows=[],
+            device=device,
+        )
+
+        self.assertEqual(stats["access_set"], 0)
+        self.assertEqual(stats["tagged_set"], 0)
+        self.assertEqual(stats["skipped_no_vlan"], 1)
+        self.assertEqual(iface.save_calls, 0)

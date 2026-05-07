@@ -2,7 +2,7 @@ import django_filters
 from netbox.filtersets import NetBoxModelFilterSet
 
 from .choices import DiscoveryProtocolChoices, NapalmDriverChoices
-from .models import DiscoveryRun, DiscoveryTarget
+from .models import DiscoveryRun, DiscoveryTarget, MacAddressTableEntry
 
 
 class DiscoveryTargetFilterSet(NetBoxModelFilterSet):
@@ -44,3 +44,26 @@ class DiscoveryRunFilterSet(NetBoxModelFilterSet):
 
     def search(self, queryset, name, value):
         return queryset.filter(target__name__icontains=value)
+
+
+class MacAddressTableEntryFilterSet(NetBoxModelFilterSet):
+    device_id = django_filters.NumberFilter(field_name="device", label="Device (id)")
+    device = django_filters.CharFilter(field_name="device__name", lookup_expr="icontains")
+    interface_id = django_filters.NumberFilter(field_name="interface", label="Interface (id)")
+    vlan_vid = django_filters.NumberFilter(field_name="vlan_vid")
+    mac_address = django_filters.CharFilter(field_name="mac_address", lookup_expr="icontains")
+    is_static = django_filters.BooleanFilter()
+
+    class Meta:
+        model = MacAddressTableEntry
+        fields = ("device_id", "interface_id", "mac_address", "vlan_vid", "is_static")
+
+    def search(self, queryset, name, value):
+        # Allow free-text search by MAC fragment, interface name, or device name
+        from django.db.models import Q
+
+        return queryset.filter(
+            Q(mac_address__icontains=value)
+            | Q(interface_name__icontains=value)
+            | Q(device__name__icontains=value)
+        )

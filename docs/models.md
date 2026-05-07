@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Defines the two database models for the plugin: `DiscoveryTarget` and `DiscoveryRun`.
+Defines the database models for the plugin: `DiscoveryTarget`, `DiscoveryRun`, and `MacAddressTableEntry`.
 Also provides Fernet-based encryption helpers for credential storage.
 
 ---
@@ -77,6 +77,30 @@ Read-only audit log for a single execution of a `DiscoveryTarget`. Created at jo
 ### Methods
 
 - `append_log(message)` — append a line to the log field
+
+---
+
+## MacAddressTableEntry
+
+Stores the L2 forwarding view collected from each device's MAC address table. The set of rows for a given device is replaced wholesale on each successful discovery run when `collect_mac_address_table` is enabled.
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `device` | ForeignKey → dcim.Device (CASCADE) | Device that learned the MAC |
+| `interface` | ForeignKey → dcim.Interface (SET_NULL) | Resolved local interface (nullable when unmatched) |
+| `interface_name` | CharField(100) | Raw interface name as reported by the device |
+| `mac_address` | CharField(17, indexed) | MAC address, normalised to upper case |
+| `vlan` | ForeignKey → ipam.VLAN (SET_NULL) | Resolved VLAN at the device's site (nullable) |
+| `vlan_vid` | PositiveSmallIntegerField (indexed) | VLAN ID as reported (kept even when no `ipam.VLAN` row exists) |
+| `is_static` | BooleanField | Whether the device reports the entry as static |
+| `is_active` | BooleanField | Whether the entry is currently active (default true) |
+| `last_seen` | DateTimeField (auto_now) | Updated on every sync |
+
+### Constraints
+
+- `UniqueConstraint(device, mac_address, vlan_vid, interface_name)` — prevents duplicate inserts inside one snapshot.
 
 ---
 

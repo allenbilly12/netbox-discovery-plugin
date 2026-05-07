@@ -13,20 +13,29 @@ from django.utils import timezone
 from django.views import View
 from netbox.views import generic
 
-from .filtersets import DiscoveryRunFilterSet, DiscoveryTargetFilterSet
+from .filtersets import (
+    DiscoveryRunFilterSet,
+    DiscoveryTargetFilterSet,
+    MacAddressTableEntryFilterSet,
+)
 from .forms import (
     DiscoveryRunFilterForm,
     DiscoveryTargetFilterForm,
     DiscoveryTargetForm,
+    MacAddressTableEntryFilterForm,
 )
-from .models import DiscoveryRun, DiscoveryTarget
+from .models import DiscoveryRun, DiscoveryTarget, MacAddressTableEntry
 from .sync.netbox_sync import (
     _add_journal_entry,
     _describe_termination,
     _get_cable_endpoints,
     _set_cable_endpoints,
 )
-from .tables import DiscoveryRunTable, DiscoveryTargetTable
+from .tables import (
+    DiscoveryRunTable,
+    DiscoveryTargetTable,
+    MacAddressTableEntryTable,
+)
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
 
@@ -469,3 +478,20 @@ class DiscoveryRunView(generic.ObjectView):
             "results_updated": [r for r in results if r.get("status") == "updated"],
             "results_failed": [r for r in results if r.get("status") == "failed"],
         }
+
+
+# ---------------------------------------------------------------------------
+# MAC address table views
+# ---------------------------------------------------------------------------
+
+
+class MacAddressTableEntryListView(generic.ObjectListView):
+    queryset = (
+        MacAddressTableEntry.objects.select_related("device", "interface", "vlan")
+        .order_by("device__name", "vlan_vid", "mac_address")
+    )
+    table = MacAddressTableEntryTable
+    filterset = MacAddressTableEntryFilterSet
+    filterset_form = MacAddressTableEntryFilterForm
+    template_name = "netbox_discovery/macaddresstableentry_list.html"
+    actions = {}
