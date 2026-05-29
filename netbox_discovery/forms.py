@@ -85,7 +85,7 @@ class DiscoveryTargetForm(NetBoxModelForm):
             if not line:
                 continue
             try:
-                netaddr.IPNetwork(line, implicit_prefix=False)
+                netaddr.IPNetwork(line)
             except (netaddr.AddrFormatError, ValueError):
                 errors.append(f"'{line}' is not a valid IP address or CIDR range.")
         if errors:
