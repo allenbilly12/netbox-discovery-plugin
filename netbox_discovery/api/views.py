@@ -4,6 +4,7 @@ from netbox.api.viewsets import NetBoxModelViewSet
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
+from ..filtersets import DiscoveryRunFilterSet, DiscoveryTargetFilterSet
 from ..models import DiscoveryRun, DiscoveryTarget
 from .serializers import DiscoveryRunSerializer, DiscoveryTargetSerializer
 
@@ -13,6 +14,8 @@ logger = logging.getLogger("netbox.plugins.netbox_discovery")
 class DiscoveryTargetViewSet(NetBoxModelViewSet):
     queryset = DiscoveryTarget.objects.prefetch_related("tags")
     serializer_class = DiscoveryTargetSerializer
+    # Without this the REST API ignores filtersets.py entirely.
+    filterset_class = DiscoveryTargetFilterSet
 
     @action(detail=True, methods=["post"], url_path="run")
     def run(self, request, pk=None):
@@ -47,4 +50,5 @@ class DiscoveryTargetViewSet(NetBoxModelViewSet):
 class DiscoveryRunViewSet(NetBoxModelViewSet):
     queryset = DiscoveryRun.objects.select_related("target").order_by("-started_at")
     serializer_class = DiscoveryRunSerializer
+    filterset_class = DiscoveryRunFilterSet
     http_method_names = ["get", "head", "options"]  # Read-only

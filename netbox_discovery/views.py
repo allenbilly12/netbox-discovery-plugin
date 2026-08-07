@@ -13,6 +13,7 @@ from django.utils import timezone
 from django.views import View
 from netbox.views import generic
 
+from .config import get_setting
 from .filtersets import (
     DiscoveryRunFilterSet,
     DiscoveryTargetFilterSet,
@@ -27,6 +28,7 @@ from .forms import (
 from .models import DiscoveryRun, DiscoveryTarget, MacAddressTableEntry
 from .sync.netbox_sync import (
     _add_journal_entry,
+    _assign_interface_mac,
     _describe_termination,
     _get_cable_endpoints,
     _set_cable_endpoints,
@@ -109,7 +111,6 @@ class MergeDevicesView(LoginRequiredMixin, PermissionRequiredMixin, View):
 
     def post(self, request):
         from dcim.models import Device
-        from django.conf import settings
 
         keep_id = request.POST.get("keep_id")
         delete_id = request.POST.get("delete_id")
@@ -121,9 +122,7 @@ class MergeDevicesView(LoginRequiredMixin, PermissionRequiredMixin, View):
         keeper = get_object_or_404(Device, pk=keep_id)
         duplicate = get_object_or_404(Device, pk=delete_id)
 
-        holding_site_name = (
-            settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get("holding_site_name", "Holding")
-        )
+        holding_site_name = get_setting("holding_site_name")
 
         try:
             with transaction.atomic():
@@ -255,9 +254,12 @@ def _merge_interface_attributes(target_iface, source_iface) -> None:
     if not getattr(target_iface, "mtu", None) and getattr(source_iface, "mtu", None):
         target_iface.mtu = source_iface.mtu
         changed = True
-    if not getattr(target_iface, "mac_address", None) and getattr(source_iface, "mac_address", None):
-        target_iface.mac_address = source_iface.mac_address
-        changed = True
+    # NetBox 4.2+: mac_address is a read-only property over primary_mac_address.
+    # Assigning to it raises AttributeError, which aborted the whole merge.
+    source_mac = getattr(source_iface, "mac_address", None)
+    if not getattr(target_iface, "mac_address", None) and source_mac:
+        if _assign_interface_mac(target_iface, str(source_mac)):
+            changed = True
     if not getattr(target_iface, "enabled", True) and getattr(source_iface, "enabled", True):
         target_iface.enabled = source_iface.enabled
         changed = True

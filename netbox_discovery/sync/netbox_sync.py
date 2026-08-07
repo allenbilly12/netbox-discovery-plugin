@@ -31,7 +31,9 @@ def _get_conflict_logger() -> logging.Logger:
     clog.setLevel(logging.WARNING)
     clog.propagate = False  # don't bubble up into the main NetBox log
 
-    log_path = "/var/log/netbox/discovery_conflicts.log"
+    from ..config import get_setting
+
+    log_path = get_setting("conflict_log_path")
     try:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(
@@ -94,6 +96,41 @@ def _normalize_mac(value) -> Optional[str]:
 def _mac_equal(a, b) -> bool:
     """Case- and separator-insensitive MAC equality."""
     return _normalize_mac(a) == _normalize_mac(b)
+
+
+def _assign_interface_mac(iface, mac: str) -> bool:
+    """
+    Point an interface's primary MAC at a dcim.MACAddress object.
+
+    NetBox 4.2 moved MAC addresses out of Interface into a first-class
+    dcim.MACAddress model. Interface.mac_address is now a read-only
+    cached_property derived from primary_mac_address, so the old
+    `iface.mac_address = mac` assignment raises AttributeError. It used to be
+    wrapped in a bare `except: pass`, which is why MAC sync silently stopped
+    working rather than failing visibly.
+
+    Returns True when the interface's primary MAC changed; the caller is
+    responsible for saving the interface.
+    """
+    from django.contrib.contenttypes.models import ContentType
+    from dcim.models import MACAddress
+
+    if _mac_equal(iface.mac_address, mac):
+        return False
+
+    iface_ct = ContentType.objects.get_for_model(iface)
+    # Scope to this interface: NetBox permits the same MAC on more than one
+    # object, and the primary MAC must belong to the interface referencing it.
+    mac_obj, _created = MACAddress.objects.get_or_create(
+        mac_address=mac,
+        assigned_object_type=iface_ct,
+        assigned_object_id=iface.pk,
+    )
+    iface.primary_mac_address = mac_obj
+    # mac_address is a cached_property over primary_mac_address — drop any
+    # value cached before this assignment so later reads are accurate.
+    iface.__dict__.pop("mac_address", None)
+    return True
 
 
 def _is_management_interface_name(name: str) -> bool:
@@ -180,8 +217,8 @@ def sync_device(
     from django.utils.text import slugify
 
     if options is None:
-        from django.conf import settings
-        options = settings.PLUGINS_CONFIG.get("netbox_discovery", {})
+        from ..config import get_discovery_options
+        options = get_discovery_options()
 
     if log_fn is None:
         log_fn = lambda msg: logger.info(msg)
@@ -853,12 +890,8 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
         if mtu and iface.mtu != mtu:
             iface.mtu = mtu
             changed_fields.append("mtu")
-        if mac and not _mac_equal(iface.mac_address, mac):
-            try:
-                iface.mac_address = mac
-                changed_fields.append("mac_address")
-            except Exception:
-                pass
+        if mac and _assign_interface_mac(iface, mac):
+            changed_fields.append("primary_mac_address")
 
         # Interface speed sync (Tier 1.2) — NAPALM reports Mbps, NetBox stores kbps
         if sync_speed:

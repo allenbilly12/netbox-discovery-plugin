@@ -11,9 +11,10 @@ import logging.handlers
 import os
 import threading
 
-from django.conf import settings
 from django.utils import timezone
 from netbox.jobs import JobRunner
+
+from .config import get_discovery_options, get_setting
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
 
@@ -37,7 +38,7 @@ def _get_discovery_run_logger() -> logging.Logger:
     run_logger.setLevel(logging.INFO)
     run_logger.propagate = False
 
-    log_path = "/var/log/netbox/discovery_runs.log"
+    log_path = get_setting("run_log_path")
     try:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(
@@ -98,19 +99,12 @@ class DiscoveryJob(JobRunner):
             started_at=timezone.now(),
         )
 
-        plugin_config = settings.PLUGINS_CONFIG.get("netbox_discovery", {})
-        holding_site = plugin_config.get("holding_site_name", "Holding")
-        ssh_timeout = target.ssh_timeout or plugin_config.get("ssh_timeout", 10)
+        holding_site = get_setting("holding_site_name")
+        ssh_timeout = target.ssh_timeout or get_setting("ssh_timeout")
 
-        # Build options dict for collector and sync
-        discovery_options = {
-            "sync_platform": plugin_config.get("sync_platform", True),
-            "sync_interface_speed": plugin_config.get("sync_interface_speed", True),
-            "sync_fqdn": plugin_config.get("sync_fqdn", True),
-            "create_prefixes": plugin_config.get("create_prefixes", False),
-            "collect_vrfs": plugin_config.get("collect_vrfs", False),
-            "collect_inventory": plugin_config.get("collect_inventory", False),
-        }
+        # Built centrally so a new feature flag cannot be added to
+        # default_settings without also being plumbed through to the collector.
+        discovery_options = get_discovery_options()
 
         counters = {
             "hosts_scanned": 0,
@@ -295,14 +289,20 @@ class DiscoveryJob(JobRunner):
             _update_last_run(target)
 
     def _safe_log(self, msg: str):
-        """Log via NetBox JobRunner methods, silently ignoring if unavailable."""
+        """
+        Emit a line to the NetBox job log so it appears in the job detail UI.
+
+        JobRunner instantiates `self.logger` for us. This previously called
+        `self.log_info()` then `self.job.log()` — neither exists on JobRunner,
+        so every line raised twice and was discarded, and the job UI showed
+        nothing. Only genuinely unexpected failures are suppressed here, and
+        they are reported once rather than silently.
+        """
         try:
-            self.log_info(msg)
+            self.logger.info(msg)
         except Exception:
-            try:
-                self.job.log(msg)
-            except Exception:
-                pass  # already logged via Python logger above
+            # Never let a logging failure abort an in-flight discovery run.
+            logger.exception("Failed to write to the NetBox job log")
 
 
 def _finish_run(run, counters: dict, status: str, log_text: str, device_results: list = None):

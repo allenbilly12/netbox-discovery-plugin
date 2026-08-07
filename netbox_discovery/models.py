@@ -2,9 +2,9 @@ import logging
 
 from django.db import models
 from django.urls import reverse
-from django.conf import settings
 from netbox.models import NetBoxModel
 
+from .config import get_setting
 from .choices import (
     NapalmDriverChoices,
     DiscoveryProtocolChoices,
@@ -19,7 +19,7 @@ def _get_fernet():
     try:
         from cryptography.fernet import Fernet
 
-        key = settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get("encryption_key", "")
+        key = get_setting("encryption_key")
         if not key:
             return None
         if isinstance(key, str):
@@ -170,27 +170,21 @@ class DiscoveryTarget(NetBoxModel):
         """Return per-target username or fall back to global config."""
         if self.credential_username:
             return self.credential_username
-        return settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get(
-            "default_username", ""
-        )
+        return get_setting("default_username")
 
     def get_effective_password(self):
         """Return per-target password or fall back to global config."""
         pw = self.credential_password
         if pw:
             return pw
-        return settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get(
-            "default_password", ""
-        )
+        return get_setting("default_password")
 
     def get_effective_enable_secret(self):
         """Return per-target enable secret or fall back to global config."""
         sec = self.enable_secret
         if sec:
             return sec
-        return settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get(
-            "default_enable_secret", ""
-        )
+        return get_setting("default_enable_secret")
 
     def get_target_list(self):
         """Return list of non-empty target strings."""

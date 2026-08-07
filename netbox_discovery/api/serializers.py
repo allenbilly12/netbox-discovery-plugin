@@ -47,13 +47,16 @@ class DiscoveryTargetSerializer(NetBoxModelSerializer):
             "tags",
             "custom_fields",
         )
+        # Required for ?brief=true and for nested representation of this
+        # serializer inside others.
+        brief_fields = ("id", "url", "display", "name", "description", "enabled")
 
 
 class DiscoveryRunSerializer(NetBoxModelSerializer):
     url = serializers.HyperlinkedIdentityField(
         view_name="plugins-api:netbox_discovery-api:discoveryrun-detail"
     )
-    target = serializers.SerializerMethodField()
+    target = DiscoveryTargetSerializer(nested=True, read_only=True)
 
     class Meta:
         model = DiscoveryRun
@@ -75,6 +78,4 @@ class DiscoveryRunSerializer(NetBoxModelSerializer):
             "last_updated",
         )
         read_only_fields = fields
-
-    def get_target(self, obj):
-        return {"id": obj.target_id, "name": obj.target.name, "url": obj.target.get_absolute_url()}
+        brief_fields = ("id", "url", "display", "status", "started_at", "completed_at")

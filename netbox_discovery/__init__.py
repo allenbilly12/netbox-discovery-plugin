@@ -11,7 +11,11 @@ class DiscoveryConfig(PluginConfig):
     base_url = "discovery"
     min_version = "4.0.0"
 
-    default_config = {
+    # NOTE: NetBox reads `default_settings` / `required_settings`. These were
+    # previously named `default_config` / `required_config`, which NetBox
+    # ignores entirely — every value below was dead metadata and each call site
+    # carried its own duplicate literal default. Do not rename these back.
+    default_settings = {
         "holding_site_name": "Holding",
         "ssh_timeout": 10,
         "encryption_key": "",
@@ -19,6 +23,7 @@ class DiscoveryConfig(PluginConfig):
         "default_password": "",
         "default_enable_secret": "",
         "conflict_log_path": "/var/log/netbox/discovery_conflicts.log",
+        "run_log_path": "/var/log/netbox/discovery_runs.log",
         # Tier 1 — always on by default
         "sync_platform": True,
         "sync_interface_speed": True,
@@ -31,7 +36,11 @@ class DiscoveryConfig(PluginConfig):
         "collect_mac_address_table": False,
     }
 
-    required_config = []
+    # `encryption_key` is deliberately NOT listed here: making it a hard
+    # requirement would refuse to start an already-running deployment. It is
+    # enforced instead by a Django system check (checks.py) plus a hard failure
+    # at the point credentials are actually written — see models.encrypt_value.
+    required_settings = []
 
     def ready(self):
         super().ready()
