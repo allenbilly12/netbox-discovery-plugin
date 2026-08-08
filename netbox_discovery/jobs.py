@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import os
 import threading
+import time
 
 from django.utils import timezone
 from netbox.jobs import JobRunner
@@ -21,6 +22,44 @@ logger = logging.getLogger("netbox.plugins.netbox_discovery")
 
 # 1 hour — large enough for any realistic crawl
 JOB_TIMEOUT = 3600
+
+# Minimum seconds between Job-status polls when checking for cancellation.
+STOP_FLAG_POLL_INTERVAL = 5.0
+
+# Minimum seconds between DiscoveryRun.log DB writes. The complete log always
+# goes to the rotating run-log file; this column is a progress view.
+LOG_FLUSH_INTERVAL = 3.0
+
+# DiscoveryRun.log bounds. A large crawl can emit tens of thousands of lines,
+# and this column was previously unbounded and rewritten in full per line.
+LOG_HEAD_LINES = 2000
+LOG_TAIL_LINES = 8000
+MAX_LOG_CHARS = 2 * 1024 * 1024  # 2 MB
+
+
+def _render_log(lines: list) -> str:
+    """
+    Render buffered log lines into a bounded string for DiscoveryRun.log.
+
+    Keeps the head (target/config context) and the tail (where failures and
+    the final summary appear), dropping the middle. Nothing is lost — the
+    dedicated run-log file always receives every line.
+    """
+    total = len(lines)
+    if total > LOG_HEAD_LINES + LOG_TAIL_LINES:
+        omitted = total - LOG_HEAD_LINES - LOG_TAIL_LINES
+        parts = (
+            lines[:LOG_HEAD_LINES]
+            + [f"... [{omitted} lines omitted — see the discovery run log file] ..."]
+            + lines[-LOG_TAIL_LINES:]
+        )
+    else:
+        parts = lines
+
+    text = "\n".join(parts)
+    if len(text) > MAX_LOG_CHARS:
+        text = text[:MAX_LOG_CHARS] + "\n... [truncated]"
+    return text
 
 
 def _get_discovery_run_logger() -> logging.Logger:
@@ -62,6 +101,46 @@ def _get_discovery_run_logger() -> logging.Logger:
     return run_logger
 
 
+def has_active_discovery(target) -> bool:
+    """
+    Return True if discovery for this target is already queued or running.
+
+    Checks the NetBox Job queue as well as the DiscoveryRun table: the
+    DiscoveryRun row is only created once the job *starts*, so a job sitting
+    in the rq queue is invisible to a DiscoveryRun-only check. Without this,
+    clicking "Run Now" repeatedly launched concurrent crawls that fought over
+    the same devices.
+    """
+    from .models import DiscoveryRun
+
+    if DiscoveryRun.objects.filter(target=target, status="running").exists():
+        return True
+
+    try:
+        from core.choices import JobStatusChoices
+        from core.models import Job
+        from django.contrib.contenttypes.models import ContentType
+
+        return Job.objects.filter(
+            object_type=ContentType.objects.get_for_model(target),
+            object_id=target.pk,
+            status__in=JobStatusChoices.ENQUEUED_STATE_CHOICES,
+        ).exists()
+    except Exception:
+        # Never block a run because the Job introspection failed.
+        logger.debug("Could not inspect the Job queue for target %s", target.pk, exc_info=True)
+        return False
+
+
+def enqueue_discovery(target):
+    """Enqueue a DiscoveryJob bound to `target` so it shows on the target's Jobs tab."""
+    return DiscoveryJob.enqueue(
+        instance=target,
+        data={"target_id": target.pk},
+        name=f"Discovery: {target.name}",
+    )
+
+
 class DiscoveryJob(JobRunner):
     """
     NetBox background job that runs a full discovery cycle for one DiscoveryTarget.
@@ -70,6 +149,46 @@ class DiscoveryJob(JobRunner):
     class Meta:
         name = "Network Discovery"
         timeout = JOB_TIMEOUT
+
+    def _make_stop_flag(self):
+        """
+        Build the callable crawl() polls to decide whether to abort.
+
+        crawl() has always accepted a stop_flag and checked it per device, but
+        nothing ever passed one — so a runaway crawl could only be stopped by
+        killing the rq worker. Poll the Job row so deleting or terminating the
+        job in the NetBox UI actually stops the crawl.
+        """
+        job_pk = getattr(self.job, "pk", None)
+        if job_pk is None:
+            return lambda: False
+
+        state = {"checked": 0.0, "stop": False}
+
+        def stop_flag():
+            if state["stop"]:
+                return True
+            now = time.monotonic()
+            if now - state["checked"] < STOP_FLAG_POLL_INTERVAL:
+                return False
+            state["checked"] = now
+            try:
+                from core.choices import JobStatusChoices
+                from core.models import Job
+
+                status = (
+                    Job.objects.filter(pk=job_pk)
+                    .values_list("status", flat=True)
+                    .first()
+                )
+                # Job row deleted, or moved to a terminal state by an operator.
+                if status is None or status in JobStatusChoices.TERMINAL_STATE_CHOICES:
+                    state["stop"] = True
+            except Exception:
+                logger.debug("stop_flag poll failed", exc_info=True)
+            return state["stop"]
+
+        return stop_flag
 
     def run(self, data, commit=True):
         from .models import DiscoveryRun, DiscoveryTarget
@@ -118,18 +237,43 @@ class DiscoveryJob(JobRunner):
         log_lock = threading.Lock()  # guards log_lines, counters, device_results, neighbor_records
         final_status = "failed"
         run_logger = _get_discovery_run_logger()
+        stop_flag = self._make_stop_flag()
+
+        # DB flush pacing. Previously every single log line rebuilt the whole
+        # log via "\n".join(log_lines) *inside* the lock and issued a full
+        # TEXT-column UPDATE, so a run producing N lines did N joins and N
+        # rewrites of a steadily growing value — O(n^2) in both CPU and WAL,
+        # while every worker contended on log_lock. Flush on an interval
+        # instead; the UI is a progress view, not a live tail.
+        last_flush = [0.0]
+        flush_lock = threading.Lock()
+
+        def _flush_log_to_db(force=False):
+            """Persist the accumulated log, at most once per LOG_FLUSH_INTERVAL."""
+            now = time.monotonic()
+            if not force and now - last_flush[0] < LOG_FLUSH_INTERVAL:
+                return
+            # Serialize writers, but never block a worker waiting to flush.
+            if not flush_lock.acquire(blocking=force):
+                return
+            try:
+                if not force and now - last_flush[0] < LOG_FLUSH_INTERVAL:
+                    return
+                with log_lock:
+                    snapshot = _render_log(log_lines)
+                last_flush[0] = time.monotonic()
+                run.__class__.objects.filter(pk=run.pk).update(log=snapshot)
+            except Exception:
+                logger.exception("Failed to persist discovery run log")
+            finally:
+                flush_lock.release()
 
         def log_fn(msg):
             with log_lock:
                 log_lines.append(msg)
-                snapshot = "\n".join(log_lines)
             run_logger.info("[Discovery:%s] %s", target.name, msg)
             self._safe_log(msg)
-            # Flush every line to DB so the UI always shows the latest output
-            try:
-                run.__class__.objects.filter(pk=run.pk).update(log=snapshot)
-            except Exception:
-                pass
+            _flush_log_to_db()
 
         def log_batch(messages):
             """Flush multiple log lines atomically — keeps per-device output grouped."""
@@ -138,14 +282,9 @@ class DiscoveryJob(JobRunner):
             block = "\n".join(messages)
             with log_lock:
                 log_lines.extend(messages)
-                snapshot = "\n".join(log_lines)
             run_logger.info("[Discovery:%s]\n%s", target.name, block)
             self._safe_log(block)
-            # Single DB write for the whole block
-            try:
-                run.__class__.objects.filter(pk=run.pk).update(log=snapshot)
-            except Exception:
-                pass
+            _flush_log_to_db()
 
         try:
             log_fn(f"=== Discovery started: {target.name} ===")
@@ -236,10 +375,17 @@ class DiscoveryJob(JobRunner):
                 on_device_failed=on_device_failed,
                 log_fn=log_fn,
                 log_batch_fn=log_batch,
+                stop_flag=stop_flag,
                 max_workers=target.max_workers,
                 options=discovery_options,
+                overall_timeout=JOB_TIMEOUT,
             )
             counters["errors"] += crawl_summary.get("failed", 0)
+
+            if stop_flag():
+                log_fn("[ABORTED] Discovery cancelled — job is no longer active.")
+                final_status = "failed"
+                return
 
             # Step 3: cable sync — wire up CDP/LLDP connections post-crawl
             cables_created = 0
@@ -285,7 +431,9 @@ class DiscoveryJob(JobRunner):
 
         finally:
             # Always update the run record regardless of success/failure/early return
-            _finish_run(run, counters, final_status, "\n".join(log_lines), device_results)
+            with log_lock:
+                final_log = _render_log(log_lines)
+            _finish_run(run, counters, final_status, final_log, device_results)
             _update_last_run(target)
 
     def _safe_log(self, msg: str):
@@ -381,7 +529,7 @@ try:
             name = "Discovery Scheduler"
 
         def run(self, **kwargs):
-            from .models import DiscoveryRun, DiscoveryTarget
+            from .models import DiscoveryTarget
 
             now = timezone.now()
             for target in DiscoveryTarget.objects.filter(enabled=True, scan_interval__gt=0):
@@ -394,8 +542,8 @@ try:
                 if not due:
                     continue
 
-                # Don't enqueue a second job if one is already running for this target.
-                if DiscoveryRun.objects.filter(target=target, status="running").exists():
+                # Don't enqueue a second job if one is already queued or running.
+                if has_active_discovery(target):
                     logger.info(
                         "Skipping '%s' — a discovery run is already active",
                         target.name,
@@ -407,7 +555,7 @@ try:
                     target.name,
                     target.scan_interval,
                 )
-                DiscoveryJob.enqueue(data={"target_id": target.pk})
+                enqueue_discovery(target)
 
 except ImportError:
     logger.warning(
