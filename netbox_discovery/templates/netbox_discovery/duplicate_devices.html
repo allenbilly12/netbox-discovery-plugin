@@ -73,7 +73,7 @@
                             <form method="post"
                                   action="{% url 'plugins:netbox_discovery:duplicate_devices_merge' %}"
                                   class="d-inline"
-                                  onsubmit="return confirm('Merge \'{{ device.name }}\' into \'{{ other.name }}\' and delete \'{{ device.name }}\'?')">
+                                  data-confirm="Merge '{{ device.name }}' into '{{ other.name }}' and delete '{{ device.name }}'?">
                                 {% csrf_token %}
                                 <input type="hidden" name="keep_id" value="{{ other.pk }}">
                                 <input type="hidden" name="delete_id" value="{{ device.pk }}">
@@ -87,7 +87,7 @@
                         <form method="post"
                               action="{% url 'plugins:netbox_discovery:duplicate_device_delete' pk=device.pk %}"
                               class="d-inline"
-                              onsubmit="return confirm('Delete device \'{{ device.name }}\'? This cannot be undone.')">
+                              data-confirm="Delete device '{{ device.name }}'? This cannot be undone.">
                             {% csrf_token %}
                             <button type="submit" class="btn btn-sm btn-outline-danger">
                                 Delete
@@ -135,4 +135,22 @@
     Page {{ page_obj.number }} of {{ paginator.num_pages }} &mdash; {{ duplicate_group_count }} total group{{ duplicate_group_count|pluralize }}
 </p>
 {% endif %}
+{% endblock %}
+
+{% block javascript %}
+<script>
+// Confirmation text is carried in data-confirm rather than an inline onsubmit
+// handler. Device names come from NAPALM get_facts(), i.e. from the monitored
+// network, so they must be treated as hostile. Inside an inline handler the
+// HTML parser decodes entities BEFORE the JS is compiled, so Django's
+// autoescaping of ' to &#x27; is undone and the payload breaks out of the
+// string literal. In a plain attribute, autoescaping is sufficient and
+// dataset returns the decoded text as an inert string.
+document.addEventListener('submit', function (event) {
+    const form = event.target.closest('form[data-confirm]');
+    if (form && !window.confirm(form.dataset.confirm)) {
+        event.preventDefault();
+    }
+});
+</script>
 {% endblock %}
