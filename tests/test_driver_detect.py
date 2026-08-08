@@ -1,21 +1,9 @@
-import importlib.util
-import pathlib
 import sys
 import types
 import unittest
 from unittest import mock
 
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-MODULE_PATH = REPO_ROOT / "netbox_discovery" / "discovery" / "driver_detect.py"
-
-
-def load_module():
-    spec = importlib.util.spec_from_file_location("driver_detect_under_test", MODULE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+from tests._loader import load_driver_detect as load_module
 
 
 class DriverDetectTests(unittest.TestCase):

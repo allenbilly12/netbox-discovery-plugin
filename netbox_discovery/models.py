@@ -4,12 +4,12 @@ from django.db import models
 from django.urls import reverse
 from netbox.models import NetBoxModel
 
-from .config import get_setting
 from .choices import (
-    NapalmDriverChoices,
     DiscoveryProtocolChoices,
     DiscoveryRunStatusChoices,
+    NapalmDriverChoices,
 )
+from .config import get_setting
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
 

@@ -1,15 +1,29 @@
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
+
 from netbox.plugins import PluginConfig
+
+try:
+    # Single source of truth is pyproject.toml. Keeping a second literal here
+    # meant the two could drift silently.
+    __version__ = _dist_version("netbox-discovery")
+except PackageNotFoundError:  # pragma: no cover - running from a source tree
+    __version__ = "0.0.0.dev0"
 
 
 class DiscoveryConfig(PluginConfig):
     name = "netbox_discovery"
     verbose_name = "Network Discovery"
     description = "Discovers network devices via CDP/LLDP and NAPALM, syncing facts into NetBox"
-    version = "1.1.0"
-    author = "NetBox Discovery Contributors"
-    author_email = "noreply@example.com"
+    version = __version__
+    author = "Billy Allen"
+    author_email = "allenbilly1@gmail.com"
     base_url = "discovery"
     min_version = "4.0.0"
+    # Bound the upper end so a NetBox major upgrade refuses to load the plugin
+    # rather than failing at runtime deep inside a discovery job. Raise this
+    # deliberately once tested against the next major.
+    max_version = "4.99.99"
 
     # NOTE: NetBox reads `default_settings` / `required_settings`. These were
     # previously named `default_config` / `required_config`, which NetBox
@@ -44,11 +58,16 @@ class DiscoveryConfig(PluginConfig):
 
     def ready(self):
         super().ready()
-        # Import jobs module so @system_job registers discovery_scheduler with NetBox.
-        import netbox_discovery.jobs  # noqa: F401
-        # Defer the os_version custom field creation to post_migrate so we
-        # don't touch the DB during app initialisation (avoids RuntimeWarning).
+
         from django.db.models.signals import post_migrate
+
+        # Importing the jobs module is what registers DiscoveryScheduler with
+        # NetBox via @system_job — it is a side-effecting import, not dead code.
+        import netbox_discovery.jobs  # noqa: F401
+
+        # Custom-field creation is deferred to post_migrate so we never touch
+        # the DB during app initialisation (which raises a RuntimeWarning and
+        # breaks `manage.py migrate` on a fresh database).
         post_migrate.connect(_on_post_migrate, sender=self)
 
 

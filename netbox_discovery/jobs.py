@@ -191,10 +191,10 @@ class DiscoveryJob(JobRunner):
         return stop_flag
 
     def run(self, data, commit=True):
-        from .models import DiscoveryRun, DiscoveryTarget
-        from .discovery.scanner import scan_targets
         from .discovery.neighbor import crawl
-        from .sync.netbox_sync import sync_device, sync_cables
+        from .discovery.scanner import scan_targets
+        from .models import DiscoveryRun, DiscoveryTarget
+        from .sync.netbox_sync import sync_cables, sync_device
 
         target_id = data.get("target_id")
         if not target_id:
@@ -494,6 +494,7 @@ def _reap_stale_runs(target):
     previous worker was killed (SIGKILL) before its finally block could run.
     """
     from datetime import timedelta
+
     from .models import DiscoveryRun
 
     cutoff = timezone.now() - timedelta(seconds=JOB_TIMEOUT)

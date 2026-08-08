@@ -13,15 +13,16 @@ worker is an additional PostgreSQL backend for the lifetime of the crawl.
 Size max_workers with that in mind.
 """
 
+import inspect
 import logging
 import queue as _queue_mod
-import inspect
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import netaddr
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .collector import collect_device_data
 from .driver_detect import detect_and_connect
@@ -220,7 +221,13 @@ def crawl(
                     """
                     nonlocal warning_count, error_count
                     text = str(msg) if msg is not None else ""
-                    prefix = f"[{discovered_hostname}] " if discovered_hostname else f"[{ip} d={depth}] "
+                    # Late binding of discovered_hostname/ip/depth is deliberate,
+                    # not the bug B023 usually catches: device_log is redefined
+                    # per loop iteration and only ever called within that same
+                    # iteration, so reading the hostname at call time is what
+                    # lets lines logged after detection carry the real name
+                    # instead of the seed IP.
+                    prefix = f"[{discovered_hostname}] " if discovered_hostname else f"[{ip} d={depth}] "  # noqa: B023
                     lines = text.splitlines() or [""]
                     for line in lines:
                         if "[WARN]" in line:

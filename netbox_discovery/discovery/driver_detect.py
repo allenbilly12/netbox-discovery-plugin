@@ -11,7 +11,8 @@ default HTTP socket timeout of 60 s) cannot stall the crawl.
 
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")

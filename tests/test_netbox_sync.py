@@ -1,35 +1,9 @@
-import importlib.util
-import pathlib
 import sys
 import types
 import unittest
 from unittest import mock
 
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-MODULE_PATH = REPO_ROOT / "netbox_discovery" / "sync" / "netbox_sync.py"
-
-
-def load_module():
-    spec = importlib.util.spec_from_file_location("netbox_sync_under_test", MODULE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-
-    fake_pkg = types.ModuleType("netbox_discovery")
-    fake_sync_pkg = types.ModuleType("netbox_discovery.sync")
-    fake_classify = types.ModuleType("netbox_discovery.sync.classify")
-    fake_classify.classify_device = lambda **kwargs: {}
-
-    with mock.patch.dict(
-        sys.modules,
-        {
-            "netbox_discovery": fake_pkg,
-            "netbox_discovery.sync": fake_sync_pkg,
-            "netbox_discovery.sync.classify": fake_classify,
-        },
-    ):
-        spec.loader.exec_module(module)
-    return module
+from tests._loader import load_netbox_sync as load_module
 
 
 def _matches(obj, criteria):

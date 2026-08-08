@@ -112,8 +112,8 @@ def _assign_interface_mac(iface, mac: str) -> bool:
     Returns True when the interface's primary MAC changed; the caller is
     responsible for saving the interface.
     """
-    from django.contrib.contenttypes.models import ContentType
     from dcim.models import MACAddress
+    from django.contrib.contenttypes.models import ContentType
 
     if _mac_equal(iface.mac_address, mac):
         return False
@@ -206,15 +206,10 @@ def sync_device(
     # Import NetBox models here to avoid import errors outside NetBox context
     from dcim.models import (
         Device,
-        DeviceRole,
         DeviceType,
-        Interface,
         Manufacturer,
-        Site,
     )
-    from ipam.models import IPAddress, VLAN
     from django.db import transaction
-    from django.utils.text import slugify
 
     if options is None:
         from ..config import get_discovery_options
@@ -777,8 +772,8 @@ def _next_available_device_name(base_name: str) -> str:
 
 def _perform_hardware_refresh(old_device, hostname: str, new_device_type, role, serial: str, log_fn: Callable):
     from dcim.models import Device, Interface
-    from ipam.models import IPAddress
     from django.contrib.contenttypes.models import ContentType
+    from ipam.models import IPAddress
 
     old_model = old_device.device_type.model if old_device.device_type_id else "Unknown"
     new_model = new_device_type.model
@@ -1089,8 +1084,8 @@ def _sync_lag_members(device, lag_members: Dict[str, List[str]], log_fn: Callabl
 
 def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable, interfaces_raw: Dict = None):
     from dcim.models import Interface
-    from ipam.models import IPAddress
     from django.contrib.contenttypes.models import ContentType
+    from ipam.models import IPAddress
 
     iface_ct = ContentType.objects.get_for_model(Interface)
     preferred_primary_ip = _preferred_management_interface_ip(interfaces_ip, interfaces_raw) or mgmt_ip
@@ -1473,7 +1468,6 @@ def _sync_interface_vlans(device, vlans_raw: Dict, log_fn: Callable) -> Dict[str
     Virtual interfaces (SVIs, loopbacks, port-channels, tunnels) are skipped: switchport
     mode does not apply to them.
     """
-    from dcim.models import Interface
     from ipam.models import VLAN
 
     stats = {"access_set": 0, "tagged_set": 0, "skipped_no_vlan": 0}
@@ -1566,9 +1560,10 @@ def _sync_mac_address_table(device, mac_entries: List[Dict], log_fn: Callable) -
     entry resolves an interface name to a NetBox Interface where possible, and a VLAN
     to a NetBox VLAN at the device's site where possible.
     """
-    from netbox_discovery.models import MacAddressTableEntry
-    from ipam.models import VLAN
     from django.db import transaction
+    from ipam.models import VLAN
+
+    from netbox_discovery.models import MacAddressTableEntry
 
     stats = {"inserted": 0, "removed": 0, "unresolved_interfaces": 0}
     site = device.site
@@ -1720,7 +1715,7 @@ def _sync_prefixes(interfaces_ip: Dict, site, log_fn: Callable):
 
 def _sync_vrfs(vrfs_raw: Dict, device, log_fn: Callable):
     """Create VRF records from get_network_instances() data (Tier 2.1)."""
-    from ipam.models import RouteTarget, VRF
+    from ipam.models import VRF, RouteTarget
 
     created_count = 0
     updated_count = 0

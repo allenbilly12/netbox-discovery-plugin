@@ -4,12 +4,9 @@ from collections import defaultdict
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin, PermissionRequiredMixin
 from django.contrib.contenttypes.models import ContentType
-from django.db import transaction
 from django.core.paginator import Paginator
-from django.http import HttpResponseRedirect
+from django.db import transaction
 from django.shortcuts import get_object_or_404, redirect, render
-from django.urls import reverse
-from django.utils import timezone
 from django.views import View
 from netbox.views import generic
 

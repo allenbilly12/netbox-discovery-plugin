@@ -1,7 +1,6 @@
 import netaddr
-
 from django import forms
-from netbox.forms import NetBoxModelForm, NetBoxModelFilterSetForm
+from netbox.forms import NetBoxModelFilterSetForm, NetBoxModelForm
 from utilities.forms.fields import TagFilterField
 from utilities.forms.rendering import FieldSet
 
@@ -9,7 +8,7 @@ from .choices import (
     DiscoveryProtocolChoices,
     NapalmDriverChoices,
 )
-from .models import DiscoveryTarget, DiscoveryRun, MacAddressTableEntry
+from .models import DiscoveryRun, DiscoveryTarget, MacAddressTableEntry
 
 
 class DiscoveryTargetForm(NetBoxModelForm):
