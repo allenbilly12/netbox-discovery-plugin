@@ -191,12 +191,33 @@ def _try_driver_timed(
             f"    Driver '{driver_name}' killed after {deadline}s "
             f"(internal timeout did not fire in time)"
         )
+        # The abandoned attempt may still succeed and hand back an *open*
+        # NAPALM session that nobody will ever read or close. Left alone
+        # those sessions accumulate on the device — Cisco boxes commonly cap
+        # concurrent vty sessions at 5, so repeated runs could lock us out.
+        future.add_done_callback(_close_abandoned_device)
         return None
     finally:
         # cancel_futures=True drops queued (not yet started) futures.
         # The already-running thread cannot be cancelled — it will die on its
         # own when pyeapi's socket eventually times out.
         executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _close_abandoned_device(future):
+    """Close a NAPALM session returned by an attempt we already gave up on."""
+    try:
+        result = future.result()
+    except Exception:
+        return  # attempt failed; nothing was opened
+    device = result[0] if isinstance(result, tuple) else result
+    if device is None:
+        return
+    try:
+        device.close()
+        logger.debug("Closed abandoned NAPALM session that completed after timeout")
+    except Exception:
+        logger.debug("Could not close abandoned NAPALM session", exc_info=True)
 
 
 def detect_and_connect(

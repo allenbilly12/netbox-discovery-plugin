@@ -5,7 +5,12 @@ a pure-Python TCP probe fallback.
 
 import logging
 import socket
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+    as_completed,
+)
 from typing import Callable, List, Set
 
 import netaddr
@@ -14,6 +19,16 @@ logger = logging.getLogger("netbox.plugins.netbox_discovery")
 
 # Ports to probe for host-up detection (TCP connect, no root needed)
 PROBE_PORTS = [22, 23, 80, 443, 8080, 8443]
+
+# Per-chunk wall-clock ceiling for nmap. python-nmap's scan() is a blocking
+# subprocess call with no Python-side timeout: --host-timeout only bounds nmap
+# internally, so a wedged nmap binary (DNS, ARP storm, zombie process) hung the
+# entire job with no deadline above it.
+NMAP_CHUNK_TIMEOUT = 300
+
+# Overall ceiling for the pure-Python probe. 6 ports x 2s per host is ~12s
+# worst case; across a large range that is hours if left unbounded.
+TCP_PROBE_TIMEOUT = 900
 
 
 def _expand_targets(targets: List[str]) -> List[str]:
@@ -57,10 +72,29 @@ def _nmap_tcp_scan(ips: List[str], log_fn: Callable) -> Set[str]:
                 # -sT = TCP connect scan
                 # -T4 = aggressive timing
                 # --open = only show open ports
-                nm.scan(
-                    hosts=targets_str,
-                    arguments=f"--unprivileged -sT -T4 -p {ports} --open --host-timeout 10s",
-                )
+                #
+                # Run under a hard wall-clock deadline: nm.scan() itself cannot
+                # be interrupted, so a hung nmap would otherwise block forever.
+                executor = ThreadPoolExecutor(max_workers=1)
+                try:
+                    future = executor.submit(
+                        nm.scan,
+                        hosts=targets_str,
+                        arguments=(
+                            f"--unprivileged -sT -T4 -p {ports} --open --host-timeout 10s"
+                        ),
+                    )
+                    future.result(timeout=NMAP_CHUNK_TIMEOUT)
+                except FuturesTimeoutError:
+                    log_fn(
+                        f"  [WARN] nmap chunk exceeded {NMAP_CHUNK_TIMEOUT}s — "
+                        "abandoning it and falling back to TCP probe"
+                    )
+                    live |= _tcp_probe(chunk, log_fn)
+                    continue
+                finally:
+                    executor.shutdown(wait=False)
+
                 for host in nm.all_hosts():
                     if nm[host].state() == "up":
                         live.add(host)
@@ -93,18 +127,42 @@ def _tcp_probe_single(ip: str) -> bool:
 
 
 def _tcp_probe(ips: List[str], log_fn: Callable) -> Set[str]:
-    """Pure-Python TCP connect probe using a thread pool for speed."""
+    """
+    Pure-Python TCP connect probe using a thread pool for speed.
+
+    Bounded by TCP_PROBE_TIMEOUT: any host not resolved by the deadline is
+    treated as down rather than allowing an unbounded scan to consume the
+    job's entire time budget.
+    """
     live = set()
     log_fn(f"  TCP probe: checking {len(ips)} addresses (ports {PROBE_PORTS})")
-    with ThreadPoolExecutor(max_workers=50) as executor:
+    deadline = time.monotonic() + TCP_PROBE_TIMEOUT
+    timed_out = 0
+
+    executor = ThreadPoolExecutor(max_workers=50)
+    try:
         future_to_ip = {executor.submit(_tcp_probe_single, ip): ip for ip in ips}
-        for future in as_completed(future_to_ip):
-            ip = future_to_ip[future]
-            try:
-                if future.result():
-                    live.add(ip)
-            except Exception:
-                pass
+        try:
+            for future in as_completed(
+                future_to_ip, timeout=max(0.0, deadline - time.monotonic())
+            ):
+                ip = future_to_ip[future]
+                try:
+                    if future.result():
+                        live.add(ip)
+                except Exception:
+                    logger.debug("TCP probe failed for %s", ip, exc_info=True)
+        except FuturesTimeoutError:
+            timed_out = sum(1 for f in future_to_ip if not f.done())
+            log_fn(
+                f"  [WARN] TCP probe hit its {TCP_PROBE_TIMEOUT}s ceiling — "
+                f"{timed_out} address(es) left unchecked and treated as down"
+            )
+    finally:
+        # Don't block on in-flight connects; their sockets carry their own
+        # 2s timeout and will retire on their own.
+        executor.shutdown(wait=False, cancel_futures=True)
+
     return live
 
 
