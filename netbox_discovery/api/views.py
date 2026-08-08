@@ -1,7 +1,9 @@
 import logging
 
+from django.shortcuts import get_object_or_404
 from netbox.api.viewsets import NetBoxModelViewSet
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
 from ..filtersets import DiscoveryRunFilterSet, DiscoveryTargetFilterSet
@@ -20,7 +22,18 @@ class DiscoveryTargetViewSet(NetBoxModelViewSet):
     @action(detail=True, methods=["post"], url_path="run")
     def run(self, request, pk=None):
         """Enqueue a DiscoveryJob for this target."""
-        target = self.get_object()
+        # DRF's DjangoObjectPermissions maps POST to add_<model>, so both this
+        # check and self.get_object()'s restriction would have used the "add"
+        # action. That is the wrong permission for launching a credentialed SSH
+        # crawl, and it disagreed with the UI view, which requires "change".
+        # Check and restrict explicitly instead.
+        if not request.user.has_perm("netbox_discovery.change_discoverytarget"):
+            raise PermissionDenied(
+                "Running discovery requires the change_discoverytarget permission."
+            )
+        target = get_object_or_404(
+            DiscoveryTarget.objects.restrict(request.user, "change"), pk=pk
+        )
 
         if not target.enabled:
             return Response(
