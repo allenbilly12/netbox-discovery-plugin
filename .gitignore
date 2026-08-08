@@ -108,7 +108,11 @@ scratch/
 *.orig
 *.rej
 
-# Claude Code
+# Agent tooling
+# NOTE: do not add CLAUDE.md, AGENTS.md or docs/ here. All three are tracked
+# on purpose, and ignoring a tracked path does not untrack it — it only makes
+# NEW files under it silently invisible to `git add`. docs/ carries the
+# per-module documentation that AGENTS.md requires each change to update, so
+# ignoring it meant a new doc file would never be committed.
 .claude/
-CLAUDE.md
-docs/
+.codex
