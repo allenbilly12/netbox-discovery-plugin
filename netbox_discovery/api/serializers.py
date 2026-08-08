@@ -47,6 +47,13 @@ class DiscoveryTargetSerializer(NetBoxModelSerializer):
             "tags",
             "custom_fields",
         )
+        # last_run is bookkeeping written by the job runner. The scheduler
+        # decides whether a target is due by comparing it against
+        # scan_interval, so leaving it writable let an API client suppress or
+        # force scheduled runs. Note `url`, `credential_password` and
+        # `enable_secret` must NOT be listed here — DRF asserts that an
+        # explicitly declared field cannot also appear in read_only_fields.
+        read_only_fields = ("id", "display", "last_run", "created", "last_updated")
         # Required for ?brief=true and for nested representation of this
         # serializer inside others.
         brief_fields = ("id", "url", "display", "name", "description", "enabled")
@@ -77,5 +84,26 @@ class DiscoveryRunSerializer(NetBoxModelSerializer):
             "created",
             "last_updated",
         )
-        read_only_fields = fields
+        # Only the model-backed fields. `url` and `target` are declared above
+        # and DRF asserts that a declared field must not also appear in
+        # read_only_fields ("Cannot both declare the field ... and include it
+        # in ... read_only_fields") — setting `read_only_fields = fields` made
+        # every request to this endpoint raise AssertionError. Both are already
+        # read-only anyway: HyperlinkedIdentityField is read-only by
+        # definition, and `target` is declared with read_only=True.
+        read_only_fields = (
+            "id",
+            "display",
+            "status",
+            "started_at",
+            "completed_at",
+            "hosts_scanned",
+            "devices_created",
+            "devices_updated",
+            "errors",
+            "log",
+            "device_results",
+            "created",
+            "last_updated",
+        )
         brief_fields = ("id", "url", "display", "status", "started_at", "completed_at")
