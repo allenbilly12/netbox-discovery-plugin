@@ -14,6 +14,7 @@ Anything that genuinely needs the ORM belongs in the Django-based suite, not
 here.
 """
 
+import contextlib
 import importlib.util
 import pathlib
 import sys
@@ -21,6 +22,44 @@ import types
 from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+class FakeIntegrityError(Exception):
+    """Stand-in for django.db.IntegrityError."""
+
+
+class FakeMultipleObjectsReturned(Exception):
+    """Stand-in for Model.MultipleObjectsReturned."""
+
+
+def make_django_db_stub():
+    """
+    Build a stub `django.db` module.
+
+    netbox_sync.py imports transaction/IntegrityError lazily inside functions
+    precisely so this harness can run without Django installed, but the import
+    still has to resolve. atomic() is a real context manager so `with
+    transaction.atomic():` behaves; the savepoint calls are no-ops that record
+    nothing, since these tests assert on behaviour rather than on transaction
+    bookkeeping.
+    """
+    module = types.ModuleType("django.db")
+
+    @contextlib.contextmanager
+    def atomic(*args, **kwargs):
+        yield
+
+    module.IntegrityError = FakeIntegrityError
+    module.transaction = types.SimpleNamespace(
+        atomic=atomic,
+        savepoint=lambda *a, **k: "savepoint",
+        savepoint_rollback=lambda *a, **k: None,
+        savepoint_commit=lambda *a, **k: None,
+        set_rollback=lambda *a, **k: None,
+    )
+    module.connection = types.SimpleNamespace(close=lambda: None)
+    module.connections = {}
+    return module
 
 
 def load_plugin_module(relative_path, name=None, fake_modules=None):

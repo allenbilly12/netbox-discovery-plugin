@@ -3,6 +3,8 @@ import types
 import unittest
 from unittest import mock
 
+from tests._loader import FakeIntegrityError as tests_loader_integrity_error
+from tests._loader import FakeMultipleObjectsReturned, make_django_db_stub
 from tests._loader import load_netbox_sync as load_module
 
 
@@ -29,6 +31,17 @@ class FakeQuerySet(list):
 
     def count(self):
         return len(self)
+
+    def order_by(self, *fields):
+        """Sort by the given attribute names, supporting a leading '-'."""
+        result = FakeQuerySet(self)
+        for field in reversed(fields):
+            reverse = field.startswith("-")
+            key = field.lstrip("-")
+            result = FakeQuerySet(
+                sorted(result, key=lambda obj: getattr(obj, key, None), reverse=reverse)
+            )
+        return result
 
 
 class FakeM2MManager:
@@ -610,6 +623,7 @@ class SyncIpsTests(unittest.TestCase):
                 "django.contrib": fake_contrib,
                 "django.contrib.contenttypes": fake_contenttypes,
                 "django.contrib.contenttypes.models": fake_contenttypes_models,
+                "django.db": make_django_db_stub(),
             },
         ):
             return self.netbox_sync._sync_ips(
@@ -891,3 +905,106 @@ class SyncInterfaceVlansTests(unittest.TestCase):
         self.assertEqual(stats["tagged_set"], 0)
         self.assertEqual(stats["skipped_no_vlan"], 1)
         self.assertEqual(iface.save_calls, 0)
+
+
+class GetOrCreateOneTests(unittest.TestCase):
+    """
+    Several NetBox models this plugin keys on permit duplicate rows:
+    IPAddress.address (different VRFs; ENFORCE_GLOBAL_UNIQUE is off by
+    default), VirtualChassis.name, and dcim.MACAddress. Plain get_or_create()
+    raises MultipleObjectsReturned against those, and since sync_device() runs
+    inside a single transaction that exception discarded the entire device.
+    """
+
+    def setUp(self):
+        self.netbox_sync = load_module()
+
+    @staticmethod
+    def _manager(rows, get_or_create=None):
+        class FakeModel:
+            MultipleObjectsReturned = FakeMultipleObjectsReturned
+
+        class FakeManager:
+            model = FakeModel
+
+            def __init__(self):
+                self.created = []
+
+            def filter(self, **criteria):
+                return FakeQuerySet([r for r in rows if _matches(r, criteria)])
+
+            def get_or_create(self, defaults=None, **lookup):
+                if get_or_create is not None:
+                    return get_or_create(defaults, lookup)
+                obj = types.SimpleNamespace(pk=len(rows) + 1, **lookup)
+                rows.append(obj)
+                self.created.append(obj)
+                return obj, True
+
+        return FakeManager()
+
+    def _call(self, manager, **kwargs):
+        with mock.patch.dict(sys.modules, {"django.db": make_django_db_stub()}):
+            return self.netbox_sync._get_or_create_one(manager, **kwargs)
+
+    def test_returns_existing_row_without_creating(self):
+        existing = types.SimpleNamespace(pk=7, address="10.0.0.1/24")
+        manager = self._manager([existing])
+
+        obj, created = self._call(manager, address="10.0.0.1/24")
+
+        self.assertIs(obj, existing)
+        self.assertFalse(created)
+        self.assertEqual(manager.created, [])
+
+    def test_creates_when_absent(self):
+        manager = self._manager([])
+
+        obj, created = self._call(manager, defaults={"status": "active"}, address="10.0.0.9/24")
+
+        self.assertTrue(created)
+        self.assertEqual(obj.address, "10.0.0.9/24")
+
+    def test_picks_lowest_pk_when_duplicates_exist(self):
+        # Two rows for the same address is legal in NetBox. Resolving to the
+        # lowest pk keeps repeated runs converging on the same object rather
+        # than flip-flopping between duplicates.
+        high = types.SimpleNamespace(pk=99, address="10.0.0.1/24")
+        low = types.SimpleNamespace(pk=3, address="10.0.0.1/24")
+        manager = self._manager([high, low])
+
+        obj, created = self._call(manager, address="10.0.0.1/24")
+
+        self.assertIs(obj, low)
+        self.assertFalse(created)
+
+    def test_survives_multiple_objects_returned_from_get_or_create(self):
+        # The duplicate appears between the existence check and the create —
+        # exactly the concurrent-worker race. This used to abort the device.
+        rows = []
+
+        def racing_get_or_create(defaults, lookup):
+            rows.append(types.SimpleNamespace(pk=5, **lookup))
+            rows.append(types.SimpleNamespace(pk=6, **lookup))
+            raise FakeMultipleObjectsReturned("two rows matched")
+
+        manager = self._manager(rows, get_or_create=racing_get_or_create)
+
+        obj, created = self._call(manager, address="10.0.0.1/24")
+
+        self.assertEqual(obj.pk, 5)
+        self.assertFalse(created)
+
+    def test_survives_integrity_error_from_concurrent_insert(self):
+        rows = []
+
+        def losing_insert(defaults, lookup):
+            rows.append(types.SimpleNamespace(pk=11, **lookup))
+            raise tests_loader_integrity_error("duplicate key")
+
+        manager = self._manager(rows, get_or_create=losing_insert)
+
+        obj, created = self._call(manager, address="10.0.0.1/24")
+
+        self.assertEqual(obj.pk, 11)
+        self.assertFalse(created)

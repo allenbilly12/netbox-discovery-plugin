@@ -121,7 +121,8 @@ def _assign_interface_mac(iface, mac: str) -> bool:
     iface_ct = ContentType.objects.get_for_model(iface)
     # Scope to this interface: NetBox permits the same MAC on more than one
     # object, and the primary MAC must belong to the interface referencing it.
-    mac_obj, _created = MACAddress.objects.get_or_create(
+    mac_obj, _created = _get_or_create_one(
+        MACAddress.objects,
         mac_address=mac,
         assigned_object_type=iface_ct,
         assigned_object_id=iface.pk,
@@ -547,6 +548,47 @@ def sync_device(
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
+def _get_or_create_one(manager, defaults=None, **lookup):
+    """
+    get_or_create() that tolerates the row already being duplicated.
+
+    Several NetBox models this module keys on do NOT enforce uniqueness on the
+    field used for the lookup: IPAddress.address is legitimately duplicable
+    (different VRFs, and ENFORCE_GLOBAL_UNIQUE defaults to off),
+    VirtualChassis.name is not unique, and dcim.MACAddress has no constraint at
+    all. Plain get_or_create() raises MultipleObjectsReturned when a second row
+    exists, and because sync_device() wraps everything in one transaction that
+    exception discarded the ENTIRE device — interfaces, IPs, VLANs and all —
+    over a duplicate the plugin did not create and may not own.
+
+    Duplicates can also appear mid-run: N crawl workers sync concurrently, so
+    two threads can pass the existence check for the same object and both
+    insert. The nested atomic() keeps such an IntegrityError from poisoning the
+    outer transaction.
+
+    Resolves to the lowest pk so repeated runs converge on the same row.
+    """
+    # Imported here, not at module scope: this module is deliberately free of
+    # top-level Django imports so tests/ can load it without a NetBox install.
+    from django.db import IntegrityError, transaction
+
+    existing = manager.filter(**lookup).order_by("pk").first()
+    if existing is not None:
+        return existing, False
+
+    try:
+        with transaction.atomic():
+            return manager.get_or_create(defaults=defaults or {}, **lookup)
+    except manager.model.MultipleObjectsReturned:
+        return manager.filter(**lookup).order_by("pk").first(), False
+    except IntegrityError:
+        # Lost a race with another worker; whatever it inserted is what we want.
+        found = manager.filter(**lookup).order_by("pk").first()
+        if found is None:
+            raise
+        return found, False
+
 
 def _ensure_site(name: str):
     from dcim.models import Site
@@ -1115,13 +1157,14 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable, inter
                 prefix_len = ip_info.get("prefix_length", 32)
                 cidr = f"{ip_str}/{prefix_len}"
 
-                ip_obj, created = IPAddress.objects.get_or_create(
-                    address=cidr,
+                ip_obj, created = _get_or_create_one(
+                    IPAddress.objects,
                     defaults={
                         "assigned_object_type": iface_ct,
                         "assigned_object_id": iface.pk,
                         "status": "active",
                     },
+                    address=cidr,
                 )
                 if created:
                     stats["created"] += 1
@@ -1188,7 +1231,9 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable, inter
                 iface_ct = ContentType.objects.get_for_model(Interface)
                 kwargs["assigned_object_type"] = iface_ct
                 kwargs["assigned_object_id"] = mgmt_iface.pk
-            primary_ip, mgmt_created = IPAddress.objects.get_or_create(address=mgmt_cidr, defaults=kwargs)
+            primary_ip, mgmt_created = _get_or_create_one(
+                IPAddress.objects, defaults=kwargs, address=mgmt_cidr
+            )
             if mgmt_created:
                 stats["mgmt_created"] += 1
 
@@ -1278,9 +1323,10 @@ def _sync_virtual_chassis(
     base = hostname.split(".")[0]
 
     # Create or get the VirtualChassis record
-    vc, vc_created = VirtualChassis.objects.get_or_create(
-        name=hostname,
+    vc, vc_created = _get_or_create_one(
+        VirtualChassis.objects,
         defaults={"domain": hostname},
+        name=hostname,
     )
     if vc_created:
         log_fn(f"  [Stack] Created VirtualChassis '{hostname}'")
