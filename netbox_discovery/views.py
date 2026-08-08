@@ -1,14 +1,17 @@
 import logging
 from collections import defaultdict
 
+from dcim.models import Device
 from django.contrib import messages
-from django.contrib.auth.mixins import LoginRequiredMixin, PermissionRequiredMixin
+from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.contenttypes.models import ContentType
 from django.core.paginator import Paginator
 from django.db import transaction
+from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views import View
 from netbox.views import generic
+from utilities.views import ObjectPermissionRequiredMixin
 
 from .config import get_setting
 from .filtersets import (
@@ -49,21 +52,32 @@ def _base_name(device_name: str) -> str:
     return device_name.split(".")[0].lower() if device_name else ""
 
 
-class DuplicateDevicesView(LoginRequiredMixin, PermissionRequiredMixin, View):
+class DuplicateDevicesView(LoginRequiredMixin, ObjectPermissionRequiredMixin, View):
     """
     Lists NetBox devices that share the same base hostname but have different
     full names (e.g. router1.emea.bcd.local vs router1.us.bcd.local).
+
+    Uses NetBox's ObjectPermissionRequiredMixin rather than Django's
+    PermissionRequiredMixin. NetBox permissions are two-layer: the model-level
+    has_perm check plus a queryset.restrict() call that applies the
+    ObjectPermission constraints. Django's mixin only does the first, so a user
+    whose dcim.view_device grant is scoped to one site could previously see —
+    and on the sibling views, delete — every device in the installation.
     """
 
-    permission_required = "dcim.view_device"
+    queryset = Device.objects.all()
     template_name = "netbox_discovery/duplicate_devices.html"
 
-    def get(self, request):
-        from dcim.models import Device
+    def get_required_permission(self):
+        return "dcim.view_device"
 
+    def get(self, request):
+        # self.queryset — not Device.objects — because has_permission() has
+        # replaced it with the restricted version. Querying the manager
+        # directly would compute the restriction and then discard it.
         # Step 1: fetch only (pk, name) — minimal memory footprint.
         # Avoids loading full Device objects for every device in NetBox.
-        name_data = Device.objects.values_list("pk", "name").order_by("name")
+        name_data = self.queryset.values_list("pk", "name").order_by("name")
         groups: dict = defaultdict(list)
         for pk, name in name_data:
             key = _base_name(name)
@@ -77,7 +91,7 @@ class DuplicateDevicesView(LoginRequiredMixin, PermissionRequiredMixin, View):
         all_dup_pks = [pk for pks in dup_groups.values() for pk in pks]
         device_map = {
             d.pk: d
-            for d in Device.objects.filter(pk__in=all_dup_pks).select_related(
+            for d in self.queryset.filter(pk__in=all_dup_pks).select_related(
                 "site", "device_type__manufacturer", "role"
             )
         }
@@ -99,16 +113,23 @@ class DuplicateDevicesView(LoginRequiredMixin, PermissionRequiredMixin, View):
         })
 
 
-class MergeDevicesView(LoginRequiredMixin, PermissionRequiredMixin, View):
+class MergeDevicesView(LoginRequiredMixin, ObjectPermissionRequiredMixin, View):
     """
     POST: keep one device, copy missing data from the duplicate, then delete it.
     """
 
-    permission_required = ("dcim.change_device", "dcim.delete_device")
+    queryset = Device.objects.all()
+    # ObjectPermissionRequiredMixin restricts the queryset using the single
+    # permission returned by get_required_permission(); anything else the view
+    # needs goes here. The previous `permission_required` tuple silently did
+    # nothing useful, because the delete half was never enforced against
+    # object-level constraints.
+    additional_permissions = ("dcim.delete_device",)
+
+    def get_required_permission(self):
+        return "dcim.change_device"
 
     def post(self, request):
-        from dcim.models import Device
-
         keep_id = request.POST.get("keep_id")
         delete_id = request.POST.get("delete_id")
 
@@ -116,8 +137,14 @@ class MergeDevicesView(LoginRequiredMixin, PermissionRequiredMixin, View):
             messages.error(request, "Invalid merge request — select two different devices.")
             return redirect("plugins:netbox_discovery:duplicate_devices")
 
-        keeper = get_object_or_404(Device, pk=keep_id)
-        duplicate = get_object_or_404(Device, pk=delete_id)
+        # Two different actions, so two differently restricted querysets: the
+        # keeper is modified, the duplicate is destroyed. A user permitted to
+        # change devices at one site must not be able to delete one at another
+        # just because it appears in the same duplicate group.
+        keeper = get_object_or_404(self.queryset, pk=keep_id)
+        duplicate = get_object_or_404(
+            Device.objects.restrict(request.user, "delete"), pk=delete_id
+        )
 
         holding_site_name = get_setting("holding_site_name")
 
@@ -130,14 +157,30 @@ class MergeDevicesView(LoginRequiredMixin, PermissionRequiredMixin, View):
 
                 dup_name = duplicate.name
                 duplicate.delete()
+
+                # Inside the transaction: if the journal write fails the merge
+                # must not be reported as successful. Previously this ran after
+                # the atomic block, so a failure here left the devices merged
+                # but unrecorded.
+                _add_journal_entry(
+                    keeper,
+                    f"Discovery duplicate merge: absorbed device '{dup_name}' and "
+                    "preserved its interface/IP/connection state where possible.",
+                )
         except ValueError as exc:
             messages.error(request, str(exc))
             return redirect("plugins:netbox_discovery:duplicate_devices")
+        except ProtectedError as exc:
+            # A referencing object blocks the delete. Report it instead of
+            # returning a 500 — the previous handler only caught ValueError.
+            logger.warning("Merge blocked by protected references: %s", exc)
+            messages.error(
+                request,
+                f"Cannot delete '{duplicate.name}': other objects still reference it. "
+                "Remove those references and try again.",
+            )
+            return redirect("plugins:netbox_discovery:duplicate_devices")
 
-        _add_journal_entry(
-            keeper,
-            f"Discovery duplicate merge: absorbed device '{dup_name}' and preserved its interface/IP/connection state where possible.",
-        )
         messages.success(
             request,
             f"Merged '{dup_name}' into '{keeper.name}' and deleted the duplicate.",
@@ -145,17 +188,27 @@ class MergeDevicesView(LoginRequiredMixin, PermissionRequiredMixin, View):
         return redirect("plugins:netbox_discovery:duplicate_devices")
 
 
-class DeleteDuplicateDeviceView(LoginRequiredMixin, PermissionRequiredMixin, View):
+class DeleteDuplicateDeviceView(LoginRequiredMixin, ObjectPermissionRequiredMixin, View):
     """POST: delete a single device identified as a duplicate."""
 
-    permission_required = "dcim.delete_device"
+    queryset = Device.objects.all()
+
+    def get_required_permission(self):
+        return "dcim.delete_device"
 
     def post(self, request, pk):
-        from dcim.models import Device
-
-        device = get_object_or_404(Device, pk=pk)
+        device = get_object_or_404(self.queryset, pk=pk)
         name = device.name
-        device.delete()
+        try:
+            device.delete()
+        except ProtectedError as exc:
+            logger.warning("Delete blocked by protected references: %s", exc)
+            messages.error(
+                request,
+                f"Cannot delete '{name}': other objects still reference it.",
+            )
+            return redirect("plugins:netbox_discovery:duplicate_devices")
+
         messages.success(request, f"Device '{name}' deleted.")
         return redirect("plugins:netbox_discovery:duplicate_devices")
 
@@ -390,7 +443,7 @@ class DiscoveryTargetDeleteView(generic.ObjectDeleteView):
 # ---------------------------------------------------------------------------
 
 
-class DiscoveryTargetRunView(PermissionRequiredMixin, View):
+class DiscoveryTargetRunView(LoginRequiredMixin, ObjectPermissionRequiredMixin, View):
     """
     POST-only view that enqueues a DiscoveryJob for the given target and
     redirects back to the target detail page.
@@ -400,10 +453,13 @@ class DiscoveryTargetRunView(PermissionRequiredMixin, View):
     user who merely has view access.
     """
 
-    permission_required = "netbox_discovery.change_discoverytarget"
+    queryset = DiscoveryTarget.objects.all()
+
+    def get_required_permission(self):
+        return "netbox_discovery.change_discoverytarget"
 
     def post(self, request, pk):
-        target = get_object_or_404(DiscoveryTarget, pk=pk)
+        target = get_object_or_404(self.queryset, pk=pk)
 
         if not target.enabled:
             messages.warning(
