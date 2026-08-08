@@ -497,7 +497,11 @@ def _extract_neighbor_ips(neighbors: List[Dict]) -> List[str]:
     """Extract valid IP addresses from neighbor entries."""
     ips = []
     for n in neighbors:
-        ip = n.get("remote_ip", "").strip()
+        # `or ""` rather than a get() default: the key can be present with an
+        # explicit None, which get() will happily return, and .strip() on it
+        # raises AttributeError — aborting the crawl's expansion for the whole
+        # device rather than skipping one bad neighbor entry.
+        ip = (n.get("remote_ip") or "").strip()
         if ip and _is_valid_ip(ip) and not _is_link_local(ip):
             ips.append(ip)
     return ips
