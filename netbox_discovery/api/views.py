@@ -34,13 +34,16 @@ class DiscoveryTargetViewSet(NetBoxModelViewSet):
                 status=400,
             )
 
-        try:
-            from ..jobs import DiscoveryJob
+        from ..jobs import enqueue_discovery, has_active_discovery
 
-            DiscoveryJob.enqueue(
-                data={"target_id": target.pk},
-                name=f"Discovery: {target.name}",
+        if has_active_discovery(target):
+            return Response(
+                {"detail": f"Discovery is already queued or running for '{target.name}'."},
+                status=409,
             )
+
+        try:
+            enqueue_discovery(target)
             return Response({"detail": f"Discovery job enqueued for '{target.name}'."})
         except Exception as exc:
             logger.exception("API: Failed to enqueue job for target %s", target.pk)

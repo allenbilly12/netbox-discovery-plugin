@@ -393,11 +393,17 @@ class DiscoveryTargetDeleteView(generic.ObjectDeleteView):
 # ---------------------------------------------------------------------------
 
 
-class DiscoveryTargetRunView(View):
+class DiscoveryTargetRunView(PermissionRequiredMixin, View):
     """
     POST-only view that enqueues a DiscoveryJob for the given target and
     redirects back to the target detail page.
+
+    Requires change permission on the target: this triggers an SSH crawl of
+    the network using stored credentials, so it must not be reachable by any
+    user who merely has view access.
     """
+
+    permission_required = "netbox_discovery.change_discoverytarget"
 
     def post(self, request, pk):
         target = get_object_or_404(DiscoveryTarget, pk=pk)
@@ -417,13 +423,18 @@ class DiscoveryTargetRunView(View):
             )
             return redirect(target.get_absolute_url())
 
-        try:
-            from .jobs import DiscoveryJob
+        from .jobs import enqueue_discovery, has_active_discovery
 
-            DiscoveryJob.enqueue(
-                data={"target_id": target.pk},
-                name=f"Discovery: {target.name}",
+        if has_active_discovery(target):
+            messages.warning(
+                request,
+                f"Discovery is already queued or running for '{target.name}'. "
+                "Wait for it to finish before starting another.",
             )
+            return redirect(target.get_absolute_url())
+
+        try:
+            enqueue_discovery(target)
             messages.success(
                 request,
                 f"Discovery job enqueued for '{target.name}'. "
