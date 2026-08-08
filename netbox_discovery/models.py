@@ -139,6 +139,37 @@ class DiscoveryTarget(NetBoxModel):
     def get_absolute_url(self):
         return reverse("plugins:netbox_discovery:discoverytarget", args=[self.pk])
 
+    def serialize_object(self, *args, **kwargs):
+        """
+        Serialize for the changelog with the credential columns removed.
+
+        Every save of a NetBoxModel writes prechange/postchange JSON into
+        core.ObjectChange, which is retained long-term and readable by anyone
+        with changelog view permission.
+
+        NetBox's own serialize_object() drops keys beginning with an
+        underscore, which is very likely why these fields were named
+        _credential_password / _enable_secret with explicit db_column
+        overrides. That behaviour is an undocumented implementation detail
+        though, and it is the only thing standing between a stored SSH
+        password and the changelog. Strip them explicitly so the guarantee
+        holds regardless of NetBox version.
+
+        Both the attribute names and the db_column names are removed, since
+        which one appears depends on the serializer NetBox uses. Signature is
+        *args/**kwargs because the `exclude` parameter was added mid-4.x.
+        """
+        data = super().serialize_object(*args, **kwargs)
+        if isinstance(data, dict):
+            for key in (
+                "_credential_password",
+                "_enable_secret",
+                "credential_password",
+                "enable_secret",
+            ):
+                data.pop(key, None)
+        return data
+
     # Password property accessors
     @property
     def credential_password(self):
