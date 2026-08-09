@@ -121,7 +121,11 @@ def collect_device_data(
     t0 = time.monotonic()
     try:
         result["lag_members"] = _collect_lag_members(device, driver_name)
-        result["step_status"]["lag"] = "ok"
+        # LAG discovery is CLI-based and Cisco-only; on other platforms it was
+        # never attempted, which is "skip", not a clean "ok" with no bundles.
+        result["step_status"]["lag"] = (
+            "ok" if driver_name in ("ios", "nxos", "nxos_ssh") else "skip"
+        )
         lag_count = len(result["lag_members"])
         member_count = sum(len(members) for members in result["lag_members"].values())
         if lag_count:
@@ -171,6 +175,7 @@ def collect_device_data(
     neighbors = []
     lldp_success = discovery_protocol not in ("lldp", "both")
     cdp_success = discovery_protocol not in ("cdp", "both")
+    cdp_skipped = False
     if discovery_protocol in ("lldp", "both"):
         try:
             lldp_detail = device.get_lldp_neighbors_detail()
@@ -180,10 +185,16 @@ def collect_device_data(
                         {
                             "source": "lldp",
                             "local_interface": local_iface,
-                            "remote_hostname": n.get("remote_system_name", ""),
-                            "remote_interface": n.get("remote_port", ""),
+                            # `or ""` rather than a dict.get default: drivers
+                            # do return these keys with an explicit None, and
+                            # get() only substitutes the default when the key
+                            # is ABSENT. A None here reached .lower() during
+                            # dedupe and killed the whole device with an
+                            # AttributeError.
+                            "remote_hostname": n.get("remote_system_name") or "",
+                            "remote_interface": n.get("remote_port") or "",
                             "remote_ip": _extract_neighbor_ip(n),
-                            "remote_description": n.get("remote_system_description", ""),
+                            "remote_description": n.get("remote_system_description") or "",
                         }
                     )
             lldp_success = True
@@ -199,8 +210,8 @@ def collect_device_data(
                             {
                                 "source": "lldp",
                                 "local_interface": local_iface,
-                                "remote_hostname": n.get("hostname", ""),
-                                "remote_interface": n.get("port", ""),
+                                "remote_hostname": n.get("hostname") or "",
+                                "remote_interface": n.get("port") or "",
                                 "remote_ip": "",
                                 "remote_description": "",
                             }
@@ -220,9 +231,18 @@ def collect_device_data(
             neighbors.extend(cdp_data)
             cdp_success = True
             log_fn(f"    [6/{STEPS}] CDP: {len(cdp_data)} neighbors ({time.monotonic()-cdp_t0:.1f}s)")
+        except CdpUnsupported:
+            # Not a failure — this platform has no CDP. Distinct from CDP
+            # being available and erroring, which must not be reported as ok.
+            cdp_skipped = True
+            log_fn(f"    [6/{STEPS}] CDP not applicable for driver '{driver_name}' — skipped")
         except Exception as exc:
-            log_fn(f"    [6/{STEPS}] CDP failed ({time.monotonic()-cdp_t0:.1f}s): {exc}")
-            logger.debug("CDP CLI collection failed: %s", exc)
+            log_fn(
+                f"    [WARN] [6/{STEPS}] CDP failed ({time.monotonic()-cdp_t0:.1f}s): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            logger.warning("CDP CLI collection failed on %s: %s", driver_name, exc)
+            result["raw_errors"].append(f"CDP collection failed: {exc}")
 
     # Deduplicate: when protocol="both", the same physical connection can appear
     # in both LLDP and CDP data.  Keep the first occurrence of each
@@ -231,8 +251,8 @@ def collect_device_data(
     deduped = []
     for n in neighbors:
         key = (
-            n.get("local_interface", "").lower(),
-            n.get("remote_hostname", "").lower(),
+            (n.get("local_interface") or "").lower(),
+            (n.get("remote_hostname") or "").lower(),
         )
         if key not in seen_pairs:
             seen_pairs.add(key)
@@ -246,16 +266,36 @@ def collect_device_data(
 
     log_fn(f"    [6/{STEPS}] neighbor discovery done — {len(neighbors)} total neighbors ({time.monotonic()-t0:.1f}s)")
     result["neighbors"] = neighbors
-    result["step_status"]["neighbors"] = "ok" if (lldp_success and cdp_success) else "fail"
+    # Report per-protocol as well as the rolled-up worst case, so "CDP is not
+    # supported here" stays distinguishable from "CDP broke".
+    result["step_status"]["lldp"] = "ok" if lldp_success else "fail"
+    if cdp_skipped:
+        result["step_status"]["cdp"] = "skip"
+    else:
+        result["step_status"]["cdp"] = "ok" if cdp_success else "fail"
+    result["step_status"]["neighbors"] = (
+        "ok" if (lldp_success and (cdp_success or cdp_skipped)) else "fail"
+    )
 
     # --- Cisco Stack detection (IOS only) ---
     log_fn(f"    [7/{STEPS}] Checking for Cisco StackWise members...")
     t0 = time.monotonic()
+    stack_members = []
     if driver_name not in ("ios",):
         result["step_status"]["stack"] = "skip"
     else:
-        result["step_status"]["stack"] = "ok"
-    stack_members = _detect_cisco_stack(device, driver_name, log_fn)
+        # Status is set from the OUTCOME. It used to be assigned "ok" before
+        # the call, so a CLI failure inside _detect_cisco_stack still reported
+        # a healthy stack step.
+        try:
+            stack_members = _detect_cisco_stack(device, driver_name, log_fn)
+            result["step_status"]["stack"] = "ok"
+        except Exception as exc:
+            result["step_status"]["stack"] = "fail"
+            msg = f"Stack detection failed: {type(exc).__name__}: {exc}"
+            log_fn(f"    [WARN] [7/{STEPS}] {msg}")
+            logger.warning(msg)
+            result["raw_errors"].append(msg)
     if len(stack_members) > 1:
         log_fn(
             f"    [7/{STEPS}] Stack detected: {len(stack_members)} member(s) "
@@ -378,23 +418,29 @@ def _extract_neighbor_ip(neighbor_data: Dict) -> str:
     return ""
 
 
+class CdpUnsupported(Exception):
+    """Raised when the driver has no CDP support, as opposed to CDP failing."""
+
+
 def _get_cdp_via_cli(device, driver_name: str) -> List[Dict]:
     """
     For Cisco IOS/NX-OS devices, parse 'show cdp neighbors detail' CLI output.
     This gives richer neighbor data including management IPs.
+
+    Exceptions propagate on purpose. Swallowing them here and returning []
+    made the caller's `except` unreachable, so cdp_success was set
+    unconditionally and the run log reported "CDP: 0 neighbors" with
+    neighbors=ok. An operator reading that concludes the device is a leaf and
+    that the topology is fully mapped, when in fact CDP never ran — the crawl
+    then silently stops expanding. A device with genuinely no CDP neighbors and
+    a device where 'show cdp' was refused must not look identical.
     """
     if driver_name not in ("ios", "nxos", "nxos_ssh"):
-        return []
+        raise CdpUnsupported(f"driver '{driver_name}' does not support CDP")
 
-    neighbors = []
-    try:
-        output = device.cli(["show cdp neighbors detail"])
-        cdp_output = output.get("show cdp neighbors detail", "")
-        neighbors = _parse_cdp_neighbors(cdp_output)
-    except Exception as exc:
-        logger.debug("CDP CLI failed: %s", exc)
-
-    return neighbors
+    output = device.cli(["show cdp neighbors detail"])
+    cdp_output = output.get("show cdp neighbors detail", "")
+    return _parse_cdp_neighbors(cdp_output)
 
 
 def _is_valid_neighbor_ipv4(value: str) -> bool:
@@ -418,15 +464,25 @@ def _collect_lag_members(device, driver_name: str) -> Dict[str, List[str]]:
     if driver_name in ("nxos", "nxos_ssh"):
         commands.insert(0, "show port-channel summary")
 
+    # As with _collect_inventory: an empty result is only meaningful if at
+    # least one command actually ran. If they all errored, say so rather than
+    # reporting "no LAGs found".
+    last_exc = None
+    ran_any = False
     for command in commands:
         try:
             output = device.cli([command]).get(command, "")
         except Exception as exc:
+            last_exc = exc
             logger.debug("LAG CLI command failed (%s): %s", command, exc)
             continue
+        ran_any = True
         lag_members = _parse_lag_summary(output)
         if lag_members:
             return lag_members
+
+    if not ran_any and last_exc is not None:
+        raise last_exc
 
     return {}
 
@@ -586,13 +642,24 @@ def _collect_inventory(device, driver_name: str) -> List[Dict]:
     else:
         return []
 
+    # Track the last error so a run where EVERY command failed is reported as
+    # a failure rather than as an empty inventory. The bare `except: continue`
+    # this replaces logged nothing at all, so the caller set inventory="ok"
+    # with zero items and the operator had no way to tell "this chassis has no
+    # inventory data" from "the CLI rejected every command".
+    last_exc = None
     for command in commands:
         try:
             output = device.cli([command]).get(command, "")
-        except Exception:
+        except Exception as exc:
+            last_exc = exc
+            logger.debug("Inventory command failed (%s): %s", command, exc)
             continue
         if output:
             return _parse_inventory_output(output, driver_name)
+
+    if last_exc is not None:
+        raise last_exc
 
     return []
 

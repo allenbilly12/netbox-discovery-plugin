@@ -1,7 +1,11 @@
 import django_filters
 from netbox.filtersets import NetBoxModelFilterSet
 
-from .choices import DiscoveryProtocolChoices, NapalmDriverChoices
+from .choices import (
+    DiscoveryProtocolChoices,
+    DiscoveryRunStatusChoices,
+    NapalmDriverChoices,
+)
 from .models import DiscoveryRun, DiscoveryTarget, MacAddressTableEntry
 
 
@@ -28,14 +32,9 @@ class DiscoveryRunFilterSet(NetBoxModelFilterSet):
         field_name="target",
         label="Target",
     )
+    # Sourced from choices.py rather than duplicated, so the two cannot drift.
     status = django_filters.MultipleChoiceFilter(
-        choices=[
-            ("pending", "Pending"),
-            ("running", "Running"),
-            ("completed", "Completed"),
-            ("failed", "Failed"),
-            ("partial", "Partial"),
-        ]
+        choices=DiscoveryRunStatusChoices.choices,
     )
 
     class Meta:

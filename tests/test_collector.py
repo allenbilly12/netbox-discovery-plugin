@@ -1,18 +1,6 @@
-import importlib.util
-import pathlib
 import unittest
 
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-MODULE_PATH = REPO_ROOT / "netbox_discovery" / "discovery" / "collector.py"
-
-
-def load_module():
-    spec = importlib.util.spec_from_file_location("collector_under_test", MODULE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+from tests._loader import load_collector as load_module
 
 
 class ParseCdpNeighborsTests(unittest.TestCase):

@@ -1,4 +1,4 @@
-from netbox.plugins.navigation import PluginMenu, PluginMenuItem, PluginMenuButton
+from netbox.plugins.navigation import PluginMenu, PluginMenuButton, PluginMenuItem
 
 menu = PluginMenu(
     label="Network Discovery",

@@ -11,7 +11,8 @@ default HTTP socket timeout of 60 s) cannot stall the crawl.
 
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
@@ -58,6 +59,25 @@ def _looks_like_ip(s: str) -> bool:
         return all(0 <= int(p) <= 255 for p in parts)
     except ValueError:
         return False
+
+
+def _safe_close(device, driver_name: str = "") -> None:
+    """
+    Close a NAPALM session, never raising.
+
+    Failing to close is not actionable by the caller — it is already on an
+    error path — but it must not be invisible either, since a run that
+    silently fails to close sessions will eventually exhaust the device's vty
+    limit. Log at debug with the traceback.
+    """
+    if device is None:
+        return
+    try:
+        device.close()
+    except Exception:
+        logger.debug(
+            "Failed to close NAPALM session (driver=%s)", driver_name or "?", exc_info=True
+        )
 
 
 def _try_driver(
@@ -117,24 +137,37 @@ def _try_driver(
             timeout=max(timeout * 3, 30) if driver_name == "nxos_ssh" else timeout,
             optional_args=optional_args,
         )
-        device.open()
-        facts = device.get_facts()
+        # Once open() succeeds an SSH/HTTP session exists on the device, and
+        # from here every exit path except success must close it. get_facts()
+        # raising is the NORMAL case during auto-detection — it is how the
+        # wrong driver announces itself ("Pattern not detected") — so this path
+        # runs constantly, not just on error. Leaking here burned up to 4
+        # sessions per device before the right driver was found; Cisco commonly
+        # caps concurrent vty at 5, so a crawl could lock itself out of the
+        # network it was surveying.
+        try:
+            device.open()
+            facts = device.get_facts()
 
-        # Validate the hostname returned by get_facts(). Some drivers (e.g. IOS)
-        # successfully connect to NX-OS devices but misparse the CLI and return
-        # garbage like "Kernel". Treat that as a detection failure so we fall
-        # through to the correct driver (nxos_ssh).
-        reported_hostname = (facts.get("hostname") or "").strip().lower()
-        if reported_hostname in _GARBAGE_HOSTNAMES or reported_hostname.startswith("^") or _looks_like_ip(reported_hostname):
-            log_fn(
-                f"    Driver '{driver_name}' connected but returned garbage hostname "
-                f"'{facts.get('hostname')}' — skipping (likely wrong driver for this OS)"
-            )
-            try:
-                device.close()
-            except Exception:
-                pass
-            return None
+            # Validate the hostname returned by get_facts(). Some drivers (e.g. IOS)
+            # successfully connect to NX-OS devices but misparse the CLI and return
+            # garbage like "Kernel". Treat that as a detection failure so we fall
+            # through to the correct driver (nxos_ssh).
+            reported_hostname = (facts.get("hostname") or "").strip().lower()
+            if (
+                reported_hostname in _GARBAGE_HOSTNAMES
+                or reported_hostname.startswith("^")
+                or _looks_like_ip(reported_hostname)
+            ):
+                log_fn(
+                    f"    Driver '{driver_name}' connected but returned garbage hostname "
+                    f"'{facts.get('hostname')}' — skipping (likely wrong driver for this OS)"
+                )
+                _safe_close(device, driver_name)
+                return None
+        except Exception:
+            _safe_close(device, driver_name)
+            raise
 
         return device
 
@@ -191,12 +224,29 @@ def _try_driver_timed(
             f"    Driver '{driver_name}' killed after {deadline}s "
             f"(internal timeout did not fire in time)"
         )
+        # The abandoned attempt may still succeed and hand back an *open*
+        # NAPALM session that nobody will ever read or close. Left alone
+        # those sessions accumulate on the device — Cisco boxes commonly cap
+        # concurrent vty sessions at 5, so repeated runs could lock us out.
+        future.add_done_callback(_close_abandoned_device)
         return None
     finally:
         # cancel_futures=True drops queued (not yet started) futures.
         # The already-running thread cannot be cancelled — it will die on its
         # own when pyeapi's socket eventually times out.
         executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _close_abandoned_device(future):
+    """Close a NAPALM session returned by an attempt we already gave up on."""
+    try:
+        device = future.result()
+    except Exception:
+        return  # attempt failed; nothing was opened
+    if device is None:
+        return
+    _safe_close(device, "abandoned")
+    logger.debug("Closed abandoned NAPALM session that completed after timeout")
 
 
 def detect_and_connect(

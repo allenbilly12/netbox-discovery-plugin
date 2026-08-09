@@ -1,9 +1,12 @@
 import logging
 
+from django.shortcuts import get_object_or_404
 from netbox.api.viewsets import NetBoxModelViewSet
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
+from ..filtersets import DiscoveryRunFilterSet, DiscoveryTargetFilterSet
 from ..models import DiscoveryRun, DiscoveryTarget
 from .serializers import DiscoveryRunSerializer, DiscoveryTargetSerializer
 
@@ -13,11 +16,24 @@ logger = logging.getLogger("netbox.plugins.netbox_discovery")
 class DiscoveryTargetViewSet(NetBoxModelViewSet):
     queryset = DiscoveryTarget.objects.prefetch_related("tags")
     serializer_class = DiscoveryTargetSerializer
+    # Without this the REST API ignores filtersets.py entirely.
+    filterset_class = DiscoveryTargetFilterSet
 
     @action(detail=True, methods=["post"], url_path="run")
     def run(self, request, pk=None):
         """Enqueue a DiscoveryJob for this target."""
-        target = self.get_object()
+        # DRF's DjangoObjectPermissions maps POST to add_<model>, so both this
+        # check and self.get_object()'s restriction would have used the "add"
+        # action. That is the wrong permission for launching a credentialed SSH
+        # crawl, and it disagreed with the UI view, which requires "change".
+        # Check and restrict explicitly instead.
+        if not request.user.has_perm("netbox_discovery.change_discoverytarget"):
+            raise PermissionDenied(
+                "Running discovery requires the change_discoverytarget permission."
+            )
+        target = get_object_or_404(
+            DiscoveryTarget.objects.restrict(request.user, "change"), pk=pk
+        )
 
         if not target.enabled:
             return Response(
@@ -31,13 +47,16 @@ class DiscoveryTargetViewSet(NetBoxModelViewSet):
                 status=400,
             )
 
-        try:
-            from ..jobs import DiscoveryJob
+        from ..jobs import enqueue_discovery, has_active_discovery
 
-            DiscoveryJob.enqueue(
-                data={"target_id": target.pk},
-                name=f"Discovery: {target.name}",
+        if has_active_discovery(target):
+            return Response(
+                {"detail": f"Discovery is already queued or running for '{target.name}'."},
+                status=409,
             )
+
+        try:
+            enqueue_discovery(target)
             return Response({"detail": f"Discovery job enqueued for '{target.name}'."})
         except Exception as exc:
             logger.exception("API: Failed to enqueue job for target %s", target.pk)
@@ -47,4 +66,5 @@ class DiscoveryTargetViewSet(NetBoxModelViewSet):
 class DiscoveryRunViewSet(NetBoxModelViewSet):
     queryset = DiscoveryRun.objects.select_related("target").order_by("-started_at")
     serializer_class = DiscoveryRunSerializer
+    filterset_class = DiscoveryRunFilterSet
     http_method_names = ["get", "head", "options"]  # Read-only

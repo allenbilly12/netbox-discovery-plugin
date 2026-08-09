@@ -1,0 +1,26 @@
+# Normalize line endings.
+#
+# This repo is edited on Windows and deployed on Linux. Without this, files
+# land in the index with CRLF and every subsequent diff carries dozens of
+# whitespace-only lines — `git diff` on driver_detect.py once reported
+# 81+/60- where `--ignore-cr-at-eol` reported 21+/0-.
+#
+# Everything is LF in the repository. Git converts on checkout per the
+# platform's core.autocrlf setting.
+
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.html  text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.cfg   text eol=lf
+*.ini   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.txt   text eol=lf
+*.sh    text eol=lf diff=bash
+
+# Generated migrations are code, not data — keep them diffable.
+netbox_discovery/migrations/*.py text eol=lf

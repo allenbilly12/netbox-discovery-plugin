@@ -6,17 +6,23 @@ then enqueues newly discovered neighbor IPs for further processing
 up to max_depth levels deep.
 
 Devices are processed in parallel using a thread pool (max_workers).
-Django ORM is thread-safe — each thread gets its own DB connection
-from the pool automatically.
+
+Each worker thread opens its own Django DB connection on first ORM use and
+must close it on exit — Django has no connection pool by default, so every
+worker is an additional PostgreSQL backend for the lifetime of the crawl.
+Size max_workers with that in mind.
 """
 
+import inspect
 import logging
 import queue as _queue_mod
-import inspect
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from typing import Any, Callable, Dict, List, Optional, Set
+
+import netaddr
 
 from .collector import collect_device_data
 from .driver_detect import detect_and_connect
@@ -78,6 +84,7 @@ def crawl(
     stop_flag: Optional[Callable[[], bool]] = None,
     max_workers: int = 5,
     options: Optional[Dict[str, Any]] = None,
+    overall_timeout: int = 3600,
 ) -> Dict[str, Any]:
     """
     Concurrent BFS crawl starting from seed_ips, following LLDP/CDP neighbors.
@@ -100,6 +107,9 @@ def crawl(
                       atomically (keeps per-device output grouped).
         stop_flag: Optional callable that returns True to abort early.
         max_workers: Number of devices to process in parallel.
+        overall_timeout: Hard wall-clock ceiling for the whole crawl, in
+                         seconds. Guarantees crawl() returns rather than
+                         blocking indefinitely on the work queue.
 
     Returns:
         Summary dict with counts.
@@ -143,7 +153,11 @@ def crawl(
     for ip in seed_ips:
         work_queue.put((ip, 0))
 
-    actual_workers = min(max_workers, max(1, len(seed_ips)))
+    # Use the configured worker count directly. Capping to len(seed_ips) meant
+    # a single-seed crawl ran the entire multi-hundred-device topology on one
+    # thread, because the cap was computed before any neighbors were
+    # discovered. Surplus workers simply block harmlessly on Queue.get().
+    actual_workers = max(1, max_workers)
     log_fn(
         f"Crawl starting: {len(seed_ips)} seed IP(s), max_depth={max_depth}, "
         f"workers={actual_workers}, collect_timeout={collect_timeout}s"
@@ -207,7 +221,13 @@ def crawl(
                     """
                     nonlocal warning_count, error_count
                     text = str(msg) if msg is not None else ""
-                    prefix = f"[{discovered_hostname}] " if discovered_hostname else f"[{ip} d={depth}] "
+                    # Late binding of discovered_hostname/ip/depth is deliberate,
+                    # not the bug B023 usually catches: device_log is redefined
+                    # per loop iteration and only ever called within that same
+                    # iteration, so reading the hostname at call time is what
+                    # lets lines logged after detection carry the real name
+                    # instead of the seed IP.
+                    prefix = f"[{discovered_hostname}] " if discovered_hostname else f"[{ip} d={depth}] "  # noqa: B023
                     lines = text.splitlines() or [""]
                     for line in lines:
                         if "[WARN]" in line:
@@ -395,9 +415,17 @@ def crawl(
                     )
                     device_log("[END] Device processing complete")
                     device_log("=" * 72)
-                    # Flush all buffered lines for this device as one atomic block.
-                    _flush_device_log(device_lines)
-                    work_queue.task_done()
+                    # task_done() MUST run even if flushing fails. It used to
+                    # sit after _flush_device_log(), which reaches the DB and a
+                    # rotating file handler; one exception there skipped
+                    # task_done() and left work_queue.join() blocked forever,
+                    # wedging the rq worker until SIGKILL.
+                    try:
+                        _flush_device_log(device_lines)
+                    except Exception:
+                        logger.exception("Failed to flush device log for %s", ip)
+                    finally:
+                        work_queue.task_done()
 
         finally:
             # Release this thread's Django DB connection back to the pool.
@@ -415,8 +443,15 @@ def crawl(
     for t in threads:
         t.start()
 
-    # Block until every item (including dynamically enqueued neighbors) is done.
-    work_queue.join()
+    # Block until every item (including dynamically enqueued neighbors) is
+    # done, but never indefinitely — see _join_with_deadline.
+    completed = _join_with_deadline(work_queue, overall_timeout, stop_flag)
+    if not completed:
+        summary["timed_out"] = True
+        log_fn(
+            f"[WARN] Crawl did not drain its work queue within {overall_timeout}s "
+            "(or was cancelled) — returning with partial results."
+        )
 
     # Send poison pills so workers exit their blocking get() calls.
     for _ in range(actual_workers):
@@ -431,31 +466,62 @@ def crawl(
     return summary
 
 
+def _join_with_deadline(
+    work_queue: "_queue_mod.Queue",
+    timeout: float,
+    stop_flag: Callable[[], bool],
+) -> bool:
+    """
+    Bounded replacement for Queue.join().
+
+    Queue.join() waits forever. A single missed task_done() — or a worker
+    thread killed mid-item — therefore wedged the whole job until rq SIGKILLed
+    the process, leaving the DiscoveryRun stuck at status="running".
+
+    Returns True if the queue drained, False on timeout or cancellation.
+    """
+    deadline = time.monotonic() + timeout
+    with work_queue.all_tasks_done:
+        while work_queue.unfinished_tasks:
+            if stop_flag():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            # Wake periodically so stop_flag() stays responsive.
+            work_queue.all_tasks_done.wait(timeout=min(remaining, 2.0))
+    return True
+
+
 def _extract_neighbor_ips(neighbors: List[Dict]) -> List[str]:
     """Extract valid IP addresses from neighbor entries."""
     ips = []
     for n in neighbors:
-        ip = n.get("remote_ip", "").strip()
+        # `or ""` rather than a get() default: the key can be present with an
+        # explicit None, which get() will happily return, and .strip() on it
+        # raises AttributeError — aborting the crawl's expansion for the whole
+        # device rather than skipping one bad neighbor entry.
+        ip = (n.get("remote_ip") or "").strip()
         if ip and _is_valid_ip(ip) and not _is_link_local(ip):
             ips.append(ip)
     return ips
 
 
 def _is_valid_ip(ip: str) -> bool:
-    """Check if string is a valid IPv4 address."""
+    """Check if string is a valid IP address."""
+    # netaddr is imported at module scope: catching ImportError here used to
+    # make every neighbor IP look invalid, silently halting BFS expansion.
     try:
-        import netaddr
         netaddr.IPAddress(ip)
         return True
-    except Exception:
+    except (netaddr.AddrFormatError, ValueError, TypeError):
         return False
 
 
 def _is_link_local(ip: str) -> bool:
     """Return True for link-local and loopback addresses (should not be crawled)."""
     try:
-        import netaddr
         addr = netaddr.IPAddress(ip)
         return addr.is_link_local() or addr.is_loopback()
-    except Exception:
+    except (netaddr.AddrFormatError, ValueError, TypeError):
         return False

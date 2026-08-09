@@ -31,7 +31,9 @@ def _get_conflict_logger() -> logging.Logger:
     clog.setLevel(logging.WARNING)
     clog.propagate = False  # don't bubble up into the main NetBox log
 
-    log_path = "/var/log/netbox/discovery_conflicts.log"
+    from ..config import get_setting
+
+    log_path = get_setting("conflict_log_path")
     try:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(
@@ -94,6 +96,42 @@ def _normalize_mac(value) -> Optional[str]:
 def _mac_equal(a, b) -> bool:
     """Case- and separator-insensitive MAC equality."""
     return _normalize_mac(a) == _normalize_mac(b)
+
+
+def _assign_interface_mac(iface, mac: str) -> bool:
+    """
+    Point an interface's primary MAC at a dcim.MACAddress object.
+
+    NetBox 4.2 moved MAC addresses out of Interface into a first-class
+    dcim.MACAddress model. Interface.mac_address is now a read-only
+    cached_property derived from primary_mac_address, so the old
+    `iface.mac_address = mac` assignment raises AttributeError. It used to be
+    wrapped in a bare `except: pass`, which is why MAC sync silently stopped
+    working rather than failing visibly.
+
+    Returns True when the interface's primary MAC changed; the caller is
+    responsible for saving the interface.
+    """
+    from dcim.models import MACAddress
+    from django.contrib.contenttypes.models import ContentType
+
+    if _mac_equal(iface.mac_address, mac):
+        return False
+
+    iface_ct = ContentType.objects.get_for_model(iface)
+    # Scope to this interface: NetBox permits the same MAC on more than one
+    # object, and the primary MAC must belong to the interface referencing it.
+    mac_obj, _created = _get_or_create_one(
+        MACAddress.objects,
+        mac_address=mac,
+        assigned_object_type=iface_ct,
+        assigned_object_id=iface.pk,
+    )
+    iface.primary_mac_address = mac_obj
+    # mac_address is a cached_property over primary_mac_address — drop any
+    # value cached before this assignment so later reads are accurate.
+    iface.__dict__.pop("mac_address", None)
+    return True
 
 
 def _is_management_interface_name(name: str) -> bool:
@@ -169,19 +207,14 @@ def sync_device(
     # Import NetBox models here to avoid import errors outside NetBox context
     from dcim.models import (
         Device,
-        DeviceRole,
         DeviceType,
-        Interface,
         Manufacturer,
-        Site,
     )
-    from ipam.models import IPAddress, VLAN
     from django.db import transaction
-    from django.utils.text import slugify
 
     if options is None:
-        from django.conf import settings
-        options = settings.PLUGINS_CONFIG.get("netbox_discovery", {})
+        from ..config import get_discovery_options
+        options = get_discovery_options()
 
     if log_fn is None:
         log_fn = lambda msg: logger.info(msg)
@@ -516,6 +549,47 @@ def sync_device(
 # Helper functions
 # ---------------------------------------------------------------------------
 
+def _get_or_create_one(manager, defaults=None, **lookup):
+    """
+    get_or_create() that tolerates the row already being duplicated.
+
+    Several NetBox models this module keys on do NOT enforce uniqueness on the
+    field used for the lookup: IPAddress.address is legitimately duplicable
+    (different VRFs, and ENFORCE_GLOBAL_UNIQUE defaults to off),
+    VirtualChassis.name is not unique, and dcim.MACAddress has no constraint at
+    all. Plain get_or_create() raises MultipleObjectsReturned when a second row
+    exists, and because sync_device() wraps everything in one transaction that
+    exception discarded the ENTIRE device — interfaces, IPs, VLANs and all —
+    over a duplicate the plugin did not create and may not own.
+
+    Duplicates can also appear mid-run: N crawl workers sync concurrently, so
+    two threads can pass the existence check for the same object and both
+    insert. The nested atomic() keeps such an IntegrityError from poisoning the
+    outer transaction.
+
+    Resolves to the lowest pk so repeated runs converge on the same row.
+    """
+    # Imported here, not at module scope: this module is deliberately free of
+    # top-level Django imports so tests/ can load it without a NetBox install.
+    from django.db import IntegrityError, transaction
+
+    existing = manager.filter(**lookup).order_by("pk").first()
+    if existing is not None:
+        return existing, False
+
+    try:
+        with transaction.atomic():
+            return manager.get_or_create(defaults=defaults or {}, **lookup)
+    except manager.model.MultipleObjectsReturned:
+        return manager.filter(**lookup).order_by("pk").first(), False
+    except IntegrityError:
+        # Lost a race with another worker; whatever it inserted is what we want.
+        found = manager.filter(**lookup).order_by("pk").first()
+        if found is None:
+            raise
+        return found, False
+
+
 def _ensure_site(name: str):
     from dcim.models import Site
 
@@ -740,8 +814,8 @@ def _next_available_device_name(base_name: str) -> str:
 
 def _perform_hardware_refresh(old_device, hostname: str, new_device_type, role, serial: str, log_fn: Callable):
     from dcim.models import Device, Interface
-    from ipam.models import IPAddress
     from django.contrib.contenttypes.models import ContentType
+    from ipam.models import IPAddress
 
     old_model = old_device.device_type.model if old_device.device_type_id else "Unknown"
     new_model = new_device_type.model
@@ -853,12 +927,8 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
         if mtu and iface.mtu != mtu:
             iface.mtu = mtu
             changed_fields.append("mtu")
-        if mac and not _mac_equal(iface.mac_address, mac):
-            try:
-                iface.mac_address = mac
-                changed_fields.append("mac_address")
-            except Exception:
-                pass
+        if mac and _assign_interface_mac(iface, mac):
+            changed_fields.append("primary_mac_address")
 
         # Interface speed sync (Tier 1.2) — NAPALM reports Mbps, NetBox stores kbps
         if sync_speed:
@@ -1056,8 +1126,8 @@ def _sync_lag_members(device, lag_members: Dict[str, List[str]], log_fn: Callabl
 
 def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable, interfaces_raw: Dict = None):
     from dcim.models import Interface
-    from ipam.models import IPAddress
     from django.contrib.contenttypes.models import ContentType
+    from ipam.models import IPAddress
 
     iface_ct = ContentType.objects.get_for_model(Interface)
     preferred_primary_ip = _preferred_management_interface_ip(interfaces_ip, interfaces_raw) or mgmt_ip
@@ -1087,13 +1157,14 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable, inter
                 prefix_len = ip_info.get("prefix_length", 32)
                 cidr = f"{ip_str}/{prefix_len}"
 
-                ip_obj, created = IPAddress.objects.get_or_create(
-                    address=cidr,
+                ip_obj, created = _get_or_create_one(
+                    IPAddress.objects,
                     defaults={
                         "assigned_object_type": iface_ct,
                         "assigned_object_id": iface.pk,
                         "status": "active",
                     },
+                    address=cidr,
                 )
                 if created:
                     stats["created"] += 1
@@ -1160,7 +1231,9 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable, inter
                 iface_ct = ContentType.objects.get_for_model(Interface)
                 kwargs["assigned_object_type"] = iface_ct
                 kwargs["assigned_object_id"] = mgmt_iface.pk
-            primary_ip, mgmt_created = IPAddress.objects.get_or_create(address=mgmt_cidr, defaults=kwargs)
+            primary_ip, mgmt_created = _get_or_create_one(
+                IPAddress.objects, defaults=kwargs, address=mgmt_cidr
+            )
             if mgmt_created:
                 stats["mgmt_created"] += 1
 
@@ -1250,9 +1323,10 @@ def _sync_virtual_chassis(
     base = hostname.split(".")[0]
 
     # Create or get the VirtualChassis record
-    vc, vc_created = VirtualChassis.objects.get_or_create(
-        name=hostname,
+    vc, vc_created = _get_or_create_one(
+        VirtualChassis.objects,
         defaults={"domain": hostname},
+        name=hostname,
     )
     if vc_created:
         log_fn(f"  [Stack] Created VirtualChassis '{hostname}'")
@@ -1440,7 +1514,6 @@ def _sync_interface_vlans(device, vlans_raw: Dict, log_fn: Callable) -> Dict[str
     Virtual interfaces (SVIs, loopbacks, port-channels, tunnels) are skipped: switchport
     mode does not apply to them.
     """
-    from dcim.models import Interface
     from ipam.models import VLAN
 
     stats = {"access_set": 0, "tagged_set": 0, "skipped_no_vlan": 0}
@@ -1533,9 +1606,10 @@ def _sync_mac_address_table(device, mac_entries: List[Dict], log_fn: Callable) -
     entry resolves an interface name to a NetBox Interface where possible, and a VLAN
     to a NetBox VLAN at the device's site where possible.
     """
-    from netbox_discovery.models import MacAddressTableEntry
-    from ipam.models import VLAN
     from django.db import transaction
+    from ipam.models import VLAN
+
+    from netbox_discovery.models import MacAddressTableEntry
 
     stats = {"inserted": 0, "removed": 0, "unresolved_interfaces": 0}
     site = device.site
@@ -1687,7 +1761,7 @@ def _sync_prefixes(interfaces_ip: Dict, site, log_fn: Callable):
 
 def _sync_vrfs(vrfs_raw: Dict, device, log_fn: Callable):
     """Create VRF records from get_network_instances() data (Tier 2.1)."""
-    from ipam.models import RouteTarget, VRF
+    from ipam.models import VRF, RouteTarget
 
     created_count = 0
     updated_count = 0

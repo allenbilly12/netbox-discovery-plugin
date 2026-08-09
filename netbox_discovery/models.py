@@ -2,14 +2,15 @@ import logging
 
 from django.db import models
 from django.urls import reverse
-from django.conf import settings
 from netbox.models import NetBoxModel
+from netbox.models.features import JobsMixin
 
 from .choices import (
-    NapalmDriverChoices,
     DiscoveryProtocolChoices,
     DiscoveryRunStatusChoices,
+    NapalmDriverChoices,
 )
+from .config import get_setting
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
 
@@ -19,7 +20,7 @@ def _get_fernet():
     try:
         from cryptography.fernet import Fernet
 
-        key = settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get("encryption_key", "")
+        key = get_setting("encryption_key")
         if not key:
             return None
         if isinstance(key, str):
@@ -52,10 +53,14 @@ def decrypt_value(stored: str) -> str:
         return stored
 
 
-class DiscoveryTarget(NetBoxModel):
+class DiscoveryTarget(JobsMixin, NetBoxModel):
     """
     Defines a set of seed IPs / CIDRs to discover, along with credentials
     and scheduling configuration.
+
+    JobsMixin is required so DiscoveryJob.enqueue(instance=target) can bind
+    the NetBox Job row to this object. Without it, Job.full_clean() rejects
+    the enqueue with "Jobs cannot be assigned to this object type".
     """
 
     name = models.CharField(max_length=100, unique=True)
@@ -139,6 +144,37 @@ class DiscoveryTarget(NetBoxModel):
     def get_absolute_url(self):
         return reverse("plugins:netbox_discovery:discoverytarget", args=[self.pk])
 
+    def serialize_object(self, *args, **kwargs):
+        """
+        Serialize for the changelog with the credential columns removed.
+
+        Every save of a NetBoxModel writes prechange/postchange JSON into
+        core.ObjectChange, which is retained long-term and readable by anyone
+        with changelog view permission.
+
+        NetBox's own serialize_object() drops keys beginning with an
+        underscore, which is very likely why these fields were named
+        _credential_password / _enable_secret with explicit db_column
+        overrides. That behaviour is an undocumented implementation detail
+        though, and it is the only thing standing between a stored SSH
+        password and the changelog. Strip them explicitly so the guarantee
+        holds regardless of NetBox version.
+
+        Both the attribute names and the db_column names are removed, since
+        which one appears depends on the serializer NetBox uses. Signature is
+        *args/**kwargs because the `exclude` parameter was added mid-4.x.
+        """
+        data = super().serialize_object(*args, **kwargs)
+        if isinstance(data, dict):
+            for key in (
+                "_credential_password",
+                "_enable_secret",
+                "credential_password",
+                "enable_secret",
+            ):
+                data.pop(key, None)
+        return data
+
     # Password property accessors
     @property
     def credential_password(self):
@@ -170,27 +206,21 @@ class DiscoveryTarget(NetBoxModel):
         """Return per-target username or fall back to global config."""
         if self.credential_username:
             return self.credential_username
-        return settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get(
-            "default_username", ""
-        )
+        return get_setting("default_username")
 
     def get_effective_password(self):
         """Return per-target password or fall back to global config."""
         pw = self.credential_password
         if pw:
             return pw
-        return settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get(
-            "default_password", ""
-        )
+        return get_setting("default_password")
 
     def get_effective_enable_secret(self):
         """Return per-target enable secret or fall back to global config."""
         sec = self.enable_secret
         if sec:
             return sec
-        return settings.PLUGINS_CONFIG.get("netbox_discovery", {}).get(
-            "default_enable_secret", ""
-        )
+        return get_setting("default_enable_secret")
 
     def get_target_list(self):
         """Return list of non-empty target strings."""

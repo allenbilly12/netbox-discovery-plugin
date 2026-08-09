@@ -9,7 +9,7 @@ Cisco C9120 Wireless AP) must precede generic ones (e.g. Catalyst switch).
 """
 
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 # ---------------------------------------------------------------------------
 # Classification rules: pattern → (role_name, [tag_slugs])

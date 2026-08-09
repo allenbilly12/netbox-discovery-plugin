@@ -1,17 +1,35 @@
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
+
 from netbox.plugins import PluginConfig
+
+try:
+    # Single source of truth is pyproject.toml. Keeping a second literal here
+    # meant the two could drift silently.
+    __version__ = _dist_version("netbox-discovery")
+except PackageNotFoundError:  # pragma: no cover - running from a source tree
+    __version__ = "0.0.0.dev0"
 
 
 class DiscoveryConfig(PluginConfig):
     name = "netbox_discovery"
     verbose_name = "Network Discovery"
     description = "Discovers network devices via CDP/LLDP and NAPALM, syncing facts into NetBox"
-    version = "1.1.0"
-    author = "NetBox Discovery Contributors"
-    author_email = "noreply@example.com"
+    version = __version__
+    author = "Billy Allen"
+    author_email = "allenbilly1@gmail.com"
     base_url = "discovery"
     min_version = "4.0.0"
+    # Bound the upper end so a NetBox major upgrade refuses to load the plugin
+    # rather than failing at runtime deep inside a discovery job. Raise this
+    # deliberately once tested against the next major.
+    max_version = "4.99.99"
 
-    default_config = {
+    # NOTE: NetBox reads `default_settings` / `required_settings`. These were
+    # previously named `default_config` / `required_config`, which NetBox
+    # ignores entirely — every value below was dead metadata and each call site
+    # carried its own duplicate literal default. Do not rename these back.
+    default_settings = {
         "holding_site_name": "Holding",
         "ssh_timeout": 10,
         "encryption_key": "",
@@ -19,6 +37,7 @@ class DiscoveryConfig(PluginConfig):
         "default_password": "",
         "default_enable_secret": "",
         "conflict_log_path": "/var/log/netbox/discovery_conflicts.log",
+        "run_log_path": "/var/log/netbox/discovery_runs.log",
         # Tier 1 — always on by default
         "sync_platform": True,
         "sync_interface_speed": True,
@@ -31,15 +50,24 @@ class DiscoveryConfig(PluginConfig):
         "collect_mac_address_table": False,
     }
 
-    required_config = []
+    # `encryption_key` is deliberately NOT listed here: making it a hard
+    # requirement would refuse to start an already-running deployment. It is
+    # enforced instead by a Django system check (checks.py) plus a hard failure
+    # at the point credentials are actually written — see models.encrypt_value.
+    required_settings = []
 
     def ready(self):
         super().ready()
-        # Import jobs module so @system_job registers discovery_scheduler with NetBox.
-        import netbox_discovery.jobs  # noqa: F401
-        # Defer the os_version custom field creation to post_migrate so we
-        # don't touch the DB during app initialisation (avoids RuntimeWarning).
+
         from django.db.models.signals import post_migrate
+
+        # Importing the jobs module is what registers DiscoveryScheduler with
+        # NetBox via @system_job — it is a side-effecting import, not dead code.
+        import netbox_discovery.jobs  # noqa: F401
+
+        # Custom-field creation is deferred to post_migrate so we never touch
+        # the DB during app initialisation (which raises a RuntimeWarning and
+        # breaks `manage.py migrate` on a fresh database).
         post_migrate.connect(_on_post_migrate, sender=self)
 
 

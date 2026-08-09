@@ -8,21 +8,48 @@ version = "1.1.0"
 description = "NetBox plugin for automatic network device discovery via CDP/LLDP and NAPALM"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
-    {name = "Billy Allen", email = "noidea@example.com"}
+    {name = "Billy Allen", email = "allenbilly1@gmail.com"}
 ]
 keywords = ["netbox", "network", "discovery", "cdp", "lldp", "napalm", "plugin"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: Django",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Information Technology",
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
 ]
+
+# NOTE: `netbox` itself is not on PyPI, so it cannot be declared here. The
+# supported NetBox range lives in DiscoveryConfig.min_version/max_version and
+# is enforced by NetBox at startup.
+#
+# napalm stays a hard requirement: there is no fallback for device connection,
+# so a missing napalm means the plugin cannot do its job at all. python-nmap
+# is optional because scanner.py has a real pure-Python TCP probe fallback.
 dependencies = [
     "napalm>=4.1.0",
-    "python-nmap>=0.7.1",
     "netaddr>=0.8.0",
     "cryptography>=42.0",
+]
+
+[project.optional-dependencies]
+# Faster host discovery. Also needs the `nmap` binary on PATH, which no
+# Python packaging metadata can express — see the README.
+nmap = [
+    "python-nmap>=0.7.1",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
 ]
 
 [project.urls]
@@ -35,3 +62,44 @@ include = ["netbox_discovery*"]
 
 [tool.setuptools.package-data]
 netbox_discovery = ["templates/**/*.html"]
+
+# NOTE: configuration lives here rather than in pytest.ini because .gitignore
+# ignores that exact filename, so a pytest.ini would never be committed.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# The tests/ suite deliberately runs without Django or NetBox; see
+# tests/_loader.py. The Django-based suite lives in netbox_discovery/tests/
+# and runs under `manage.py test`, not pytest.
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["netbox_discovery/migrations"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "B",    # flake8-bugbear
+]
+ignore = [
+    "B008",  # function call in default argument — deliberate for log buffers
+    "E501",  # line length is handled by the formatter
+    "E731",  # `log_fn = log_fn or (lambda msg: None)` is the idiom used throughout
+]
+
+# NOT enabled: "UP" (pyupgrade). It flags 170 typing.List/Optional annotations
+# for rewriting to PEP 585/604 syntax. That is a worthwhile cleanup, but it is
+# pure churn across every module and would bury the security and stability
+# changes it would land alongside. Enable it in a dedicated commit of its own.
+
+[tool.ruff.lint.per-file-ignores]
+# Tests build deliberately odd objects and shadow names for fixtures.
+"tests/*" = ["B011"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["netbox_discovery"]
