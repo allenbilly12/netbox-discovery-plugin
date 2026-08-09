@@ -3,6 +3,7 @@ import logging
 from django.db import models
 from django.urls import reverse
 from netbox.models import NetBoxModel
+from netbox.models.features import JobsMixin
 
 from .choices import (
     DiscoveryProtocolChoices,
@@ -52,10 +53,14 @@ def decrypt_value(stored: str) -> str:
         return stored
 
 
-class DiscoveryTarget(NetBoxModel):
+class DiscoveryTarget(JobsMixin, NetBoxModel):
     """
     Defines a set of seed IPs / CIDRs to discover, along with credentials
     and scheduling configuration.
+
+    JobsMixin is required so DiscoveryJob.enqueue(instance=target) can bind
+    the NetBox Job row to this object. Without it, Job.full_clean() rejects
+    the enqueue with "Jobs cannot be assigned to this object type".
     """
 
     name = models.CharField(max_length=100, unique=True)

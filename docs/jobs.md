@@ -10,6 +10,10 @@ Background job orchestration. Contains the main `DiscoveryJob` class and the per
 
 Subclass of NetBox `JobRunner`. Executed by `netbox-rq` workers.
 
+`enqueue_discovery(target)` binds the job with `instance=target` so it
+appears on the target's Jobs tab. `DiscoveryTarget` must inherit
+`JobsMixin` or `Job.full_clean()` rejects the enqueue.
+
 ### Execution Flow
 
 ```

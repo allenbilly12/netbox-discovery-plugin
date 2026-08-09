@@ -21,6 +21,10 @@ Encrypt/decrypt a string. If no encryption key is configured (dev/test environme
 
 Represents a discovery job configuration: what to scan, how to authenticate, and how often to run.
 
+Inherits `JobsMixin` + `NetBoxModel`. `JobsMixin` is required for
+`DiscoveryJob.enqueue(instance=target)` — NetBox rejects jobs bound to
+models that do not declare the jobs feature.
+
 ### Fields
 
 | Field | Type | Description |
